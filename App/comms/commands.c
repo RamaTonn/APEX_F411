@@ -688,10 +688,10 @@ static void command_telstat(const protocol_args_t *args)
 
 /* eres
  *
- * Measures the per-phase resistance from the slope between two operating
- * points, which cancels the fixed voltage the dead time loses. A single
- * point cannot separate the two and reports a resistance several times
- * too high. */
+ * Measures each phase's resistance from three line-to-line runs, taking
+ * the slope between two operating points in each, which cancels the
+ * fixed voltage the dead time loses. A single point cannot separate the
+ * two and reports a resistance several times too high. */
 static void command_eres(const protocol_args_t *args)
 {
     estimate_resistance_result_t result;
@@ -703,34 +703,40 @@ static void command_eres(const protocol_args_t *args)
     if (outcome != ESTIMATE_OK) {
         /* The reason alone does not say whether the drive never got
          * going or ran away, and those want opposite fixes -- so report
-         * where it stopped and how far the current had got by then. */
+         * where it stopped and how far the current had got by then.
+         * Which pair stopped narrows it further: a bad connection on one
+         * phase fails the two runs that touch it and passes the third. */
         protocol_reply_begin(PROTOCOL_STATUS_ERROR, "eres");
-        protocol_reply_text("reason",    estimate_result_text(outcome));
-        protocol_reply_uint("at_duty",   result.fault_duty);
-        protocol_reply_int("at_ma",      result.fault_current_ma);
-        protocol_reply_uint("lo_duty",   result.low_duty);
-        protocol_reply_int("lo_ma",      result.low_current_ma);
+        protocol_reply_text("reason",  estimate_result_text(outcome));
+        protocol_reply_text("at_pair", estimate_pair_text(result.fault_pair));
+        protocol_reply_uint("at_duty", result.fault_duty);
+        protocol_reply_int("at_ma",    result.fault_current_ma);
         protocol_reply_end();
         return;
     }
 
     protocol_reply_begin(PROTOCOL_STATUS_OK, "eres");
-    protocol_reply_uint("mohm", result.resistance_mohm);
-    /* Both operating points and the bus they were taken against, so the
-     * answer can be recomputed by hand: the terminal resistance is the
-     * voltage difference between them over the current difference, and
-     * the phase resistance is two thirds of that. */
-    protocol_reply_int("lo_ma",  result.low_current_ma);
-    protocol_reply_int("hi_ma",  result.high_current_ma);
-    protocol_reply_uint("lo_duty", result.low_duty);
-    protocol_reply_uint("hi_duty", result.high_duty);
+    /* Per phase, which is what the question was, followed by the three
+     * line-to-line measurements they were solved from so the arithmetic
+     * can be checked by hand: R_a = (R_ab + R_ca - R_bc) / 2. */
+    protocol_reply_uint("a_mohm",  result.a_mohm);
+    protocol_reply_uint("b_mohm",  result.b_mohm);
+    protocol_reply_uint("c_mohm",  result.c_mohm);
+    protocol_reply_uint("ab_mohm", result.ab_mohm);
+    protocol_reply_uint("bc_mohm", result.bc_mohm);
+    protocol_reply_uint("ca_mohm", result.ca_mohm);
+    /* The mean, which is the one number the control loop is configured
+     * with, and the spread the averaging hides. */
+    protocol_reply_uint("mohm",    result.phase_mohm);
+    protocol_reply_uint("imbal",   result.imbalance_percent);
     protocol_reply_uint("vbus_mv", result.bus_mv);
     protocol_reply_end();
 }
 
 /* eind
  *
- * Measures inductance along and across the rotor's magnet axis.
+ * Measures inductance along and across the rotor's magnet axis,
+ * independently of one another.
  *
  * The ratio between them decides whether rotor position can be estimated
  * by injecting a high-frequency signal: the injected current responds
@@ -753,20 +759,28 @@ static void command_eind(const protocol_args_t *args)
         protocol_reply_text("reason",  estimate_result_text(outcome));
         protocol_reply_int("dchg_ma",  result.d_current_change_ma);
         protocol_reply_int("qchg_ma",  result.q_current_change_ma);
-        protocol_reply_uint("ld_uh",   result.inductance_d_uh);
+        protocol_reply_uint("ld_nh",   result.inductance_d_nh);
         protocol_reply_end();
         return;
     }
 
     protocol_reply_begin(PROTOCOL_STATUS_OK, "eind");
-    protocol_reply_uint("ld_uh",  result.inductance_d_uh);
-    protocol_reply_uint("lq_uh",  result.inductance_q_uh);
+    protocol_reply_uint("ld_nh",  result.inductance_d_nh);
+    protocol_reply_uint("lq_nh",  result.inductance_q_nh);
     /* Saliency as a percentage: how much larger the across-axis
      * inductance is. Under about 110 means injection will not work
      * reliably on this motor. */
     protocol_reply_uint("sal",    result.saliency_percent);
     protocol_reply_int("dchg_ma", result.d_current_change_ma);
     protocol_reply_int("qchg_ma", result.q_current_change_ma);
+    protocol_reply_uint("d_step", result.d_duty_used);
+    protocol_reply_uint("q_step", result.q_duty_used);
+    /* The series resistance each axis was solved against. The answer
+     * depends on it, so it is reported rather than left implicit --
+     * a resistance measured on a cold motor and an inductance taken
+     * after a long run will not agree. */
+    protocol_reply_uint("dr_mohm", result.d_series_mohm);
+    protocol_reply_uint("qr_mohm", result.q_series_mohm);
     protocol_reply_end();
 }
 
@@ -775,16 +789,19 @@ static void command_param(const protocol_args_t *args)
 {
     (void)args;
 
-    /* The motor holds SI units; the protocol has always reported
-     * milliohms and microhenries, so the conversion happens here at the
-     * boundary rather than changing what the console prints. */
+    /* The motor holds SI units; the protocol reports milliohms and
+     * nanohenries, so the conversion happens here at the boundary. The
+     * inductances are in nanohenries rather than microhenries because a
+     * motor this board drives has single-figure microhenries per phase,
+     * and rounding that to an integer would throw away a tenth of the
+     * answer -- see estimate.h. */
     protocol_reply_begin(PROTOCOL_STATUS_OK, "param");
     protocol_reply_uint("mohm",
         (uint32_t)(motor->resistance_ohm * 1000.0f));
-    protocol_reply_uint("ld_uh",
-        (uint32_t)(motor->inductance_d_h * 1e6f));
-    protocol_reply_uint("lq_uh",
-        (uint32_t)(motor->inductance_q_h * 1e6f));
+    protocol_reply_uint("ld_nh",
+        (uint32_t)(motor->inductance_d_h * 1e9f));
+    protocol_reply_uint("lq_nh",
+        (uint32_t)(motor->inductance_q_h * 1e9f));
     protocol_reply_uint("poles", motor_get_pole_pairs(motor));
     protocol_reply_end();
 }
