@@ -59,6 +59,7 @@
 #include "commands.h"
 
 #include "openloop.h"
+#include "currentloop.h"
 #include "calibration.h"
 #include "estimate.h"
 

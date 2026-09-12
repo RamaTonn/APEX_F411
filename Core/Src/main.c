@@ -144,6 +144,7 @@ int main(void)
 
 	protection_init();
 	openloop_init(&motor);
+	currentloop_init(&motor);
 	telemetry_init(&motor);
 	commands_init(&motor);
 

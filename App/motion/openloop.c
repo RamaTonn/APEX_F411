@@ -249,8 +249,6 @@ void openloop_init(motor_t *m)
     average_current_ma     = 0;
     consecutive_over_limit = 0u;
     abort_limit_ma         = OPENLOOP_DEFAULT_CURRENT_LIMIT_MA;
-
-    loop_set_function(openloop_control_step);
 }
 
 /* Turn a frequency in hertz into an accumulator increment, clamping on
@@ -299,6 +297,12 @@ uint8_t openloop_start(uint16_t frequency_hz, uint16_t amplitude)
 
     commanded_frequency_hz = apply_frequency(frequency_hz);
     (void)apply_amplitude(amplitude);
+
+    /* Claim the loop's installed function now rather than at
+     * openloop_init() time, so starting this mode always takes over
+     * from whatever mode (if any) was running before -- currentloop.c
+     * does the same in currentloop_start(). */
+    loop_set_function(openloop_control_step);
 
     /* Every phase starts at the resting point, so enabling cannot apply
      * a leftover duty from a previous run. */

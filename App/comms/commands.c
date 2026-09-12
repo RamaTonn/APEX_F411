@@ -5,6 +5,7 @@
 #include "calibration.h"
 #include "loop.h"
 #include "crc16.h"
+#include "currentloop.h"
 #include "encoder.h"
 #include "estimate.h"
 #include "motor.h"
@@ -345,6 +346,13 @@ static void command_spin(const protocol_args_t *args)
         protocol_reply_error("spin", "bad_value");
         return;
     }
+
+    /* Starting open-loop drive always takes over the bridge from
+     * closed-loop current control if that was left running -- otherwise
+     * its stale "running" state would keep reporting itself as active
+     * even though the loop's installed function has moved on. */
+    currentloop_stop();
+
     if (openloop_start((uint16_t)frequency, (uint16_t)amplitude) == 0u) {
         protocol_reply_error("spin", "control_loop_not_running");
         return;
@@ -461,6 +469,78 @@ static void command_limit(const protocol_args_t *args)
 
     protocol_reply_begin(PROTOCOL_STATUS_OK, "limit");
     protocol_reply_int("lim_ma", openloop_get_current_limit());
+    protocol_reply_end();
+}
+
+/* ------------------------------------------------------------------
+ * Closed-loop current control
+ * ------------------------------------------------------------------ */
+
+static void command_iloop(const protocol_args_t *args)
+{
+    if (protocol_arg_count(args) != 3u) {
+        protocol_reply_error("iloop", "usage_iloop_id_ma_iq_ma");
+        return;
+    }
+
+    int32_t id_ma = protocol_arg_int(args, 1u, 0);
+    int32_t iq_ma = protocol_arg_int(args, 2u, 0);
+
+    if (currentloop_is_running() != 0u) {
+        /* Already regulating -- just move the targets, which keeps the
+         * integrators and the charged bootstrap capacitors rather than
+         * restarting from rest. */
+        currentloop_set_targets(id_ma, iq_ma);
+    } else {
+        /* Starting closed-loop current control always takes over the
+         * bridge from open-loop drive if that was left running --
+         * otherwise its stale "running" state would keep reporting
+         * itself as active even though the loop's installed function
+         * has moved on. */
+        openloop_stop();
+
+        if (currentloop_start(id_ma, iq_ma) == 0u) {
+            protocol_reply_error("iloop", "not_ready");
+            return;
+        }
+    }
+
+    int32_t id_target_ma;
+    int32_t iq_target_ma;
+    currentloop_get_state(&id_target_ma, &iq_target_ma, NULL, NULL);
+
+    protocol_reply_begin(PROTOCOL_STATUS_OK, "iloop");
+    protocol_reply_int("id_ma", id_target_ma);
+    protocol_reply_int("iq_ma", iq_target_ma);
+    protocol_reply_end();
+}
+
+static void command_iloopstop(const protocol_args_t *args)
+{
+    (void)args;
+    currentloop_stop();
+
+    protocol_reply_begin(PROTOCOL_STATUS_OK, "iloopstop");
+    protocol_reply_end();
+}
+
+static void command_iloopstat(const protocol_args_t *args)
+{
+    int32_t id_target_ma;
+    int32_t iq_target_ma;
+    int32_t id_measured_ma;
+    int32_t iq_measured_ma;
+
+    (void)args;
+    currentloop_get_state(&id_target_ma, &iq_target_ma,
+                          &id_measured_ma, &iq_measured_ma);
+
+    protocol_reply_begin(PROTOCOL_STATUS_OK, "iloopstat");
+    protocol_reply_uint("run",       currentloop_is_running());
+    protocol_reply_int("id_ma",      id_target_ma);
+    protocol_reply_int("iq_ma",      iq_target_ma);
+    protocol_reply_int("id_meas_ma", id_measured_ma);
+    protocol_reply_int("iq_meas_ma", iq_measured_ma);
     protocol_reply_end();
 }
 
@@ -828,6 +908,10 @@ static const struct {
     { "hz",       0x52u, command_hz       },
     { "spinstat", 0x53u, command_spinstat },
     { "limit",    0x54u, command_limit    },
+    /* closed-loop current control */
+    { "iloop",     0x90u, command_iloop     },
+    { "iloopstop", 0x91u, command_iloopstop },
+    { "iloopstat", 0x92u, command_iloopstat },
     /* calibration and commutation */
     { "calib",    0x80u, command_calib    },
     { "comm",     0x81u, command_comm     },
