@@ -32,19 +32,10 @@ static const struct {
  * motor pointer. */
 static gate_driver_t *self;
 
-/* Dead time to correct for, in nanoseconds: the gate driver's own delay
- * plus the transistors' turn-on time through the 10 ohm gate resistors.
- * Measured on this board rather than taken from a datasheet. */
-#define DEAD_TIME_NS 750u
-
-/* The switching period in nanoseconds. The timer counts to 1499 and back
- * at 96 MHz, so 2998 counts, which is 31229 nanoseconds. */
-#define PERIOD_NS 31229u
-
-/* Dead time as parts per thousand of the switching period. Derived
- * rather than written as a constant, so changing either figure keeps it
- * correct. With the values above this comes to 24. */
-#define DEAD_TIME_PER_MILLE ((DEAD_TIME_NS * 1000u) / PERIOD_NS)
+/* Dead time as parts per thousand of the switching period, from
+ * gate_driver.h -- public there because measurements that work backwards
+ * from a duty to an applied voltage need it too. */
+#define DEAD_TIME_PER_MILLE GATE_DRIVER_DEAD_TIME_PER_MILLE
 
 /* Current at which the dead time correction reaches full value, in
  * milliamps. Below this it is scaled down in proportion.

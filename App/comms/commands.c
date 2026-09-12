@@ -716,13 +716,15 @@ static void command_eres(const protocol_args_t *args)
 
     protocol_reply_begin(PROTOCOL_STATUS_OK, "eres");
     protocol_reply_uint("mohm", result.resistance_mohm);
-    /* Both operating points, so the slope can be recomputed by hand if
-     * the answer looks wrong: the resistance is the voltage difference
-     * between them divided by the current difference. */
+    /* Both operating points and the bus they were taken against, so the
+     * answer can be recomputed by hand: the terminal resistance is the
+     * voltage difference between them over the current difference, and
+     * the phase resistance is two thirds of that. */
     protocol_reply_int("lo_ma",  result.low_current_ma);
     protocol_reply_int("hi_ma",  result.high_current_ma);
     protocol_reply_uint("lo_duty", result.low_duty);
     protocol_reply_uint("hi_duty", result.high_duty);
+    protocol_reply_uint("vbus_mv", result.bus_mv);
     protocol_reply_end();
 }
 
@@ -743,7 +745,16 @@ static void command_eind(const protocol_args_t *args)
     uint8_t outcome = estimate_inductance(motor, &result);
 
     if (outcome != ESTIMATE_OK) {
-        protocol_reply_error("eind", estimate_result_text(outcome));
+        /* The current change each axis did manage is reported even on a
+         * failure: "too small" with a change of nearly nothing means the
+         * drive never got going, while one just under the threshold
+         * means only the pulse needs to be bigger. */
+        protocol_reply_begin(PROTOCOL_STATUS_ERROR, "eind");
+        protocol_reply_text("reason",  estimate_result_text(outcome));
+        protocol_reply_int("dchg_ma",  result.d_current_change_ma);
+        protocol_reply_int("qchg_ma",  result.q_current_change_ma);
+        protocol_reply_uint("ld_uh",   result.inductance_d_uh);
+        protocol_reply_end();
         return;
     }
 

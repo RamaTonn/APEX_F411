@@ -73,6 +73,28 @@
  * happens once per enable. */
 #define GATE_DRIVER_BOOTSTRAP_CHARGE_MS 5U
 
+/* Dead time to correct for, in nanoseconds: the driver's own delay plus
+ * the transistors' turn-on time through the 10 ohm gate resistors.
+ * Measured on this board rather than taken from a datasheet. */
+#define GATE_DRIVER_DEAD_TIME_NS 750U
+
+/* The switching period in nanoseconds. The timer counts to 1499 and back
+ * at 96 MHz, so 2998 counts, which is 31229 nanoseconds. */
+#define GATE_DRIVER_PERIOD_NS 31229U
+
+/* The voltage the dead time removes before any of it reaches the
+ * winding, as parts per thousand of the bus -- the same units duty is
+ * expressed in. Derived rather than written as a constant, so changing
+ * either figure above keeps it correct. Comes to 24.
+ *
+ * Public because anything working BACKWARDS from a duty to the voltage
+ * the winding actually saw has to account for it. A measurement that
+ * takes two points at the same current polarity gets it for free, since
+ * the loss is identical at both and cancels in the difference; one that
+ * steps from zero current has to subtract it explicitly. */
+#define GATE_DRIVER_DEAD_TIME_PER_MILLE \
+    ((GATE_DRIVER_DEAD_TIME_NS * 1000U) / GATE_DRIVER_PERIOD_NS)
+
 /*
  * One bridge. Owned by main.c and initialised once; every other function
  * below acts on that one instance, which this module keeps a pointer to

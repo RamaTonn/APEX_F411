@@ -1,139 +1,102 @@
 #include "estimate.h"
 
+#include <stddef.h>
+
 #include "loop.h"
 #include "gate_driver.h"
 #include "main.h"
 #include "motor.h"
 #include "sensors.h"
-#include "units.h"
 
 /* The motor being measured, for the duration of one run. */
 static motor_t *motor;
 
-/* The two currents the resistance measurement works between, in
- * milliamps.
- *
- * WHY CURRENTS RATHER THAN DUTIES OR VOLTAGES
- *
- *   A duty is a fraction of the bus, so the same duty gives twice the
- *   current at twice the supply voltage -- the measurement would depend
- *   on what the bench supply happened to be set to.
- *
- *   A fixed voltage is better but still needs the winding's resistance
- *   to be known in advance in order to choose one. Too small and no
- *   current flows; too large and it is dangerous. On this motor the
- *   whole useful range is under 300 millivolts, and 2 volts would draw
- *   nearly 40 amps.
- *
- *   Targeting a current sidesteps both. The voltage is raised from zero
- *   until the current arrives, which works on any winding and any supply
- *   without being told anything about either, and approaches the
- *   operating point from below rather than discovering it from above.
- *
- * WHY TWO OF THEM
- *
- *   The dead time removes a fixed amount of voltage -- about 290
- *   millivolts on this board -- before any of it reaches the winding.
- *   Measured at one point, that loss is indistinguishable from
- *   resistance, and gets attributed to it: an earlier single-point
- *   version of this measurement reported 186 milliohms for a 36 milliohm
- *   winding, and the difference was almost entirely dead time.
- *
- *   Between two points the loss is the same, so subtracting one from the
- *   other removes it completely and leaves only the winding. */
-#define RESISTANCE_LOW_TARGET_MA  1500
-#define RESISTANCE_HIGH_TARGET_MA 4000
+/* ------------------------------------------------------------------
+ * Resistance measurement settings
+ * ------------------------------------------------------------------ */
 
-/* How far the duty is raised each step while hunting for a target
- * current, in parts per thousand.
+/* The two currents the slope is taken between, in milliamps.
  *
- * Small enough that the current cannot go from safe to dangerous in one
- * step even on a winding with no resistance to speak of. */
+ * Targeting currents rather than duties keeps the measurement
+ * independent of both the winding and the supply: the duty is raised
+ * until the current arrives, whatever it takes to get there. */
+#define RESISTANCE_LOW_TARGET_MA  1000
+#define RESISTANCE_HIGH_TARGET_MA 3000
+
+/* How far the duty is raised each step while hunting, in parts per
+ * thousand. Small enough that the current cannot go from safe to
+ * dangerous in one step on any winding this board would be used with. */
 #define RESISTANCE_DUTY_STEP 1U
 
-/* Highest duty the hunt will reach before giving up. Well above what any
- * sensible winding needs, and still far below anything that would damage
- * the bridge.
+/* Highest duty the hunt will reach before giving up.
  *
- * On this motor's winding (tens of milliohms) the targets below arrive
- * within about ten to twenty parts per thousand once the current is
- * actually being measured correctly (see driven_axis_current_ma()) --
- * this ceiling is a backstop against a disconnected phase or a wildly
- * different motor, not something the hunt should ordinarily approach. */
-#define RESISTANCE_MAX_DUTY 120U
+ * Driving one phase against the other two, the winding sees the full
+ * duty as a fraction of the bus -- 150 parts per thousand is 1.8 volts
+ * on a 12 volt bus, which is already 30 amps through a 60 milliohm
+ * path. The sustained-current guard stops the run long before this in
+ * practice; the ceiling is a backstop for a disconnected phase, where
+ * no current flows however high the duty goes. */
+#define RESISTANCE_MAX_DUTY 150U
 
-/* How long to hold each resistance point before reading, in
- * milliseconds. The current must reach its steady value, which takes
- * several electrical time constants -- a few milliseconds is thousands
- * of them on a motor this size. */
-#define RESISTANCE_SETTLE_MS 50U
-
-/* How long to average a steady current over, in milliseconds. */
+/* How long to let the current settle after a duty change, and how long
+ * to average it for once settled, both in milliseconds.
+ *
+ * The winding reaches its steady current in a few electrical time
+ * constants -- microseconds on a motor this size -- so the settle is
+ * generous. The average removes what noise the control loop's
+ * synchronous sampling has not already. */
+#define RESISTANCE_SETTLE_MS  20U
 #define RESISTANCE_AVERAGE_MS 20U
 
-/* Duties tried for the inductance pulse, smallest first.
+/* ------------------------------------------------------------------
+ * Inductance measurement settings
+ * ------------------------------------------------------------------ */
+
+/* Duty used to pull the rotor into line with phase A, and how long to
+ * hold it there.
+ *
+ * This produces a real current, so it is kept modest; it only has to
+ * overcome friction and cogging, not accelerate anything. */
+#define ALIGN_DUTY 8U
+#define ALIGN_MS   400U
+
+/* Duties added on top for the measuring pulse, smallest first.
  *
  * Started small and raised only if the current change was too small to
- * measure, so a low inductance winding is never hit harder than it needs
- * to be.
- *
- * These are small because the winding is: at 36 milliohms on a 12 volt
- * bus, a duty of 4 parts per thousand is already most of an amp in
- * steady state, and the pulse adds to whatever current is holding the
- * rotor in place. An earlier version began at 20 and overcurrented on
- * its first attempt, with nothing smaller to fall back to. */
-static const uint16_t pulse_duties[] = { 4u, 8u, 16u, 32u, 64u };
-#define PULSE_DUTY_COUNT (sizeof pulse_duties / sizeof pulse_duties[0])
+ * measure, so a low inductance winding is never hit harder than it
+ * needs to be. */
+static const uint16_t pulse_steps[] = { 8u, 16u, 32u, 64u, 128u };
+#define PULSE_STEP_COUNT (sizeof pulse_steps / sizeof pulse_steps[0])
 
-/* A quarter turn on the 16-bit electrical angle scale: ninety degrees,
- * which is the axis across the rotor's magnets. */
-#define QUARTER_TURN 16384u
+/* How long the across-axis pre-hold lasts before its pulse, in
+ * milliseconds.
+ *
+ * The across-axis field is ninety degrees from where the rotor is
+ * sitting, so it produces maximum torque -- unlike the along-axis case,
+ * this cannot be held for long. A couple of milliseconds is far less
+ * than the rotor needs to accelerate anywhere meaningful, and it gives
+ * the current somewhere to start from so the dead time cancels in the
+ * step the same way it does along the other axis. */
+#define ACROSS_PREHOLD_MS 2U
+
+/* ------------------------------------------------------------------
+ * Small helpers
+ * ------------------------------------------------------------------ */
 
 static int32_t absolute(int32_t value)
 {
     return (value < 0) ? -value : value;
 }
 
-/* Apply a vector on the q axis at one angle.
+/* Largest magnitude among the three phase currents.
  *
- * Amplitude arrives as parts per thousand of the bus, as every command
- * on this board does, and is turned into volts against the measured bus;
- * motor_apply_dq turns it back into a duty.
- *
- * @param angle      electrical angle, 0 to 65535
- * @param amplitude  parts per thousand of bus voltage
- * @param current_a  phase A current, milliamps, for dead time correction
- * @param current_b  phase B current, milliamps, for dead time correction */
-static void apply_vector(uint16_t angle,
-                         uint16_t amplitude,
-                         int32_t  current_a,
-                         int32_t  current_b)
-{
-    float bus_volts = (float)sensors_get_bus_mv() * 0.001f;
-    float v_q = ((float)amplitude / (float)GATE_DRIVER_DUTY_SCALE)
-                * bus_volts;
-
-    motor_apply_dq(motor, 0.0f, v_q,
-                   (float)angle * MOTOR_ANGLE_TO_RAD,
-                   current_a, current_b,
-                   sensors_get_bus_mv());
-}
-
-/* Largest magnitude among the three phase currents, for the overcurrent
- * safety check.
- *
- * This has to look at real phase current rather than the driven-axis
- * current below: the safety limit is on what the windings and the
- * bridge actually carry, and at some angles a phase can carry current
- * while the driven-axis reading of a DIFFERENT phase sits near zero --
- * see driven_axis_current_ma() for why. Checking only one phase, as an
- * earlier version of this file did, could let real current climb
- * unnoticed on the other two. */
+ * Phase C has no sensor; the three currents of a star-connected winding
+ * sum to zero, so C is whatever makes the sum zero. The limit is on what
+ * the windings and the bridge physically carry, so all three count --
+ * whichever phase the measurement happens to be reading. */
 static int32_t largest_phase_current_ma(int32_t current_a_ma,
                                         int32_t current_b_ma)
 {
-    /* Phase C has no sensor. The three phase currents of a star-connected
-     * winding must sum to zero, so C is whatever makes the sum zero. */
     int32_t current_c_ma = -(current_a_ma + current_b_ma);
 
     int32_t largest = absolute(current_a_ma);
@@ -146,323 +109,168 @@ static int32_t largest_phase_current_ma(int32_t current_a_ma,
     return largest;
 }
 
-/* Where a run gave up, if it did: the duty being applied and the
- * largest phase current seen there. Recorded by the helpers below and
- * copied into the caller's result, so a failed run can say where it
- * went wrong rather than only that it did. Module-level for the same
- * reason `motor` is: one run happens at a time. */
+/* One phase's current, by index. */
+static int32_t phase_current_ma(uint8_t phase,
+                                int32_t current_a_ma,
+                                int32_t current_b_ma)
+{
+    if (phase == GATE_DRIVER_PHASE_A) {
+        return current_a_ma;
+    }
+    if (phase == GATE_DRIVER_PHASE_B) {
+        return current_b_ma;
+    }
+    return -(current_a_ma + current_b_ma);
+}
+
+/* Where a run gave up, if it did. Module-level for the same reason
+ * `motor` is: one run happens at a time. */
 static uint16_t fault_duty;
 static int32_t  fault_current_ma;
 
-/* Tracks how long the current has been CONTINUOUSLY above the limit.
- *
- * WHY A SINGLE READING IS NOT ENOUGH TO ACT ON
- *
- *   openloop.c makes this argument at OPENLOOP_ABORT_CONSECUTIVE_SAMPLES
- *   and it applies here unchanged: the current measurement carries a few
- *   counts of noise, and a one-off switching transient is not what
- *   damages anything -- sustained current is. An earlier version of this
- *   file aborted on the first reading over the limit and gave up on
- *   perfectly good runs because of a single spike.
- *
- *   Time rather than a sample count, because these loops spin far faster
- *   than the control interrupt republishes a current, so the same
- *   reading gets seen many times over and counting iterations would
- *   measure CPU speed rather than how long the current was really high. */
-typedef struct {
-    uint8_t  over;
-    uint32_t since_tick;
-} overcurrent_watch_t;
-
-static void overcurrent_watch_reset(overcurrent_watch_t *watch)
-{
-    watch->over       = 0u;
-    watch->since_tick = 0u;
-}
-
-/* @param watch       the watch being updated
- * @param largest_ma  largest phase current magnitude just measured
- * @return 1 once the current has been above the limit continuously for
- *         ESTIMATE_OVERCURRENT_SUSTAIN_MS, 0 otherwise */
-static uint8_t overcurrent_watch_update(overcurrent_watch_t *watch,
-                                        int32_t largest_ma)
-{
-    if (largest_ma <= ESTIMATE_CURRENT_LIMIT_MA) {
-        watch->over = 0u;
-        return 0u;
-    }
-
-    if (watch->over == 0u) {
-        watch->over       = 1u;
-        watch->since_tick = HAL_GetTick();
-        return 0u;
-    }
-
-    return ((HAL_GetTick() - watch->since_tick)
-                >= ESTIMATE_OVERCURRENT_SUSTAIN_MS) ? 1u : 0u;
-}
-
-/* Bring every phase back to the resting point, for when a measurement
- * stops early and the duty it was applying should not stay applied. */
+/* Bring every phase to ground, stopping the current without disabling
+ * the bridge. */
 static void rest_bridge(void)
 {
     for (uint8_t phase = 0u; phase < GATE_DRIVER_PHASE_COUNT; phase++) {
-        gate_driver_set_duty(phase, 500u);
+        gate_driver_set_duty(phase, 0u);
     }
 }
 
-/* The current actually flowing along the axis being driven, in
- * milliamps.
- *
- * WHY THIS, AND NOT A RAW PHASE CURRENT
- *
- *   apply_vector() always drives a pure q-axis vector (Vd = 0) at
- *   whatever angle it is given. motor_apply_dq turns that into a
- *   BALANCED three-phase voltage set -- the three phase voltages always
- *   sum to zero, by construction of the inverse Clarke transform.
- *
- *   A balanced drive only puts its full magnitude onto one particular
- *   phase's own axis at one particular angle (ninety degrees from
- *   wherever that phase's own axis sits in this frame); at any other
- *   angle -- angle zero included, which is what this file used to read
- *   phase A at -- a phase's own current can sit near zero while real
- *   current flows through the other two. That is not a fault in the
- *   winding or the measurement setup: it is what a balanced vector
- *   looks like projected onto an axis it happens to be orthogonal to.
- *   No amount of raising the drive voltage changes that projection.
- *
- *   Reading the current back through the same Park/Clarke transform
- *   motor_get_dq_currents() already provides -- at the SAME angle the
- *   vector was driven at -- recovers the actual driven-axis magnitude
- *   correctly regardless of which angle was chosen, because the
- *   transform undoes exactly the rotation that made a raw phase reading
- *   angle-dependent in the first place. */
-static int32_t driven_axis_current_ma(uint16_t angle,
-                                      int32_t  current_a_ma,
-                                      int32_t  current_b_ma)
+/* Phase A at `duty`, B and C grounded. Field along phase A's own axis;
+ * the winding sees 1.5 R and 1.5 L. */
+static void drive_along_axis(uint16_t duty)
 {
-    float id_a;
-    float iq_a;
-
-    motor_get_dq_currents(motor, current_a_ma, current_b_ma,
-                          (float)angle * MOTOR_ANGLE_TO_RAD, &id_a, &iq_a);
-
-    /* Vd is always zero going out, so Iq is always the component that
-     * matters coming back -- see the note above. */
-    return (int32_t)(iq_a * 1000.0f);
+    gate_driver_set_duty(GATE_DRIVER_PHASE_B, 0u);
+    gate_driver_set_duty(GATE_DRIVER_PHASE_C, 0u);
+    gate_driver_set_duty(GATE_DRIVER_PHASE_A, duty);
 }
 
-/* Average the driven-axis current over a period of time, giving up early
- * if the current stays over the limit for long enough to matter.
- *
- * The control loop samples at a fixed point in every switching period,
- * so its values are already free of switching ripple. Averaging removes
- * what remains.
- *
- * @param angle         electrical angle the vector is held at
- * @param amplitude     parts per thousand of bus voltage
- * @param milliseconds  how long to average over
- * @param tripped_out   set to 1 if the run gave up on sustained
- *                      overcurrent, 0 otherwise. May be NULL.
- * @return average driven-axis current in milliamps */
-static int32_t average_current_ma(uint16_t angle,
-                                  uint16_t amplitude,
-                                  uint32_t milliseconds,
-                                  uint8_t *tripped_out)
+/* Phase B at `duty`, C grounded, A left however the caller set it.
+ * With A floating this is two phases in series: 2 R and 2 L, with the
+ * field ninety electrical degrees from phase A's axis. */
+static void drive_across_axis(uint16_t duty)
 {
-    int64_t  total = 0;
-    uint32_t count = 0u;
-    uint32_t start = HAL_GetTick();
-    int32_t  current_a;
-    int32_t  current_b;
-
-    overcurrent_watch_t watch;
-    overcurrent_watch_reset(&watch);
-
-    if (tripped_out != NULL) {
-        *tripped_out = 0u;
-    }
-
-    while ((HAL_GetTick() - start) < milliseconds) {
-        sensors_get_currents(&current_a, &current_b);
-
-        int32_t largest = largest_phase_current_ma(current_a, current_b);
-
-        if (overcurrent_watch_update(&watch, largest) != 0u) {
-            rest_bridge();
-            fault_duty       = amplitude;
-            fault_current_ma = largest;
-            if (tripped_out != NULL) {
-                *tripped_out = 1u;
-            }
-            break;
-        }
-
-        /* The vector is re-applied while averaging, for the same reason
-         * hold_vector_for exists: the dead time correction is computed
-         * from the present current, so it has to be recomputed as that
-         * current moves. Leaving the duties as they were would freeze
-         * the correction at whatever it happened to be. */
-        apply_vector(angle, amplitude, current_a, current_b);
-
-        total += driven_axis_current_ma(angle, current_a, current_b);
-        count++;
-    }
-
-    return (count > 0u) ? (int32_t)(total / (int32_t)count) : 0;
+    gate_driver_set_duty(GATE_DRIVER_PHASE_C, 0u);
+    gate_driver_set_duty(GATE_DRIVER_PHASE_B, duty);
 }
 
-/* Hold a voltage vector steady for a period, re-applying it as the
- * current changes.
- *
- * Applying it once is not enough. The dead time correction inside
- * motor_apply_dq depends on the measured current, and at the moment the
- * vector is first applied that current is zero -- so no correction is
- * made, the commanded voltage is swallowed by the dead time, and no
- * current ever starts to flow. The measurement then reports that
- * nothing happened, which is true but for the wrong reason.
- *
- * Re-applying lets the correction find its own level: whatever small
- * current does begin to flow produces a correction, which admits more
- * voltage, which produces more current, until it settles.
- *
- * WATCHES THE CURRENT LIMIT THROUGHOUT, NOT JUST AT THE END
- *
- *   An earlier version of this function applied the vector for the
- *   whole hold with no limit check at all, relying on whatever called
- *   it to measure current afterward. That leaves the full hold duration
- *   -- for the resistance hunt, up to RESISTANCE_SETTLE_MS -- during
- *   which a duty that turns out to draw well over the limit is applied
- *   unchecked.
- *
- *   This loop already re-reads current every iteration anyway, for the
- *   dead time correction above, so watching it costs nothing extra. It
- *   takes a SUSTAINED excursion to stop the run, not a single reading --
- *   see overcurrent_watch_t for why acting on one reading threw away
- *   good runs on nothing more than a switching transient.
- *
- * @param angle         electrical angle to hold
- * @param amplitude     parts per thousand of bus voltage
- * @param milliseconds  how long to hold it
- * @return 1 on success, 0 if the current stayed over the limit long
- *         enough to give up -- the bridge is already back at rest duty
- *         when this returns 0 */
-static uint8_t hold_vector_for(uint16_t angle,
-                               uint16_t amplitude,
-                               uint32_t milliseconds)
-{
-    uint32_t start = HAL_GetTick();
-    int32_t  current_a;
-    int32_t  current_b;
-
-    overcurrent_watch_t watch;
-    overcurrent_watch_reset(&watch);
-
-    while ((HAL_GetTick() - start) < milliseconds) {
-        sensors_get_currents(&current_a, &current_b);
-
-        int32_t largest = largest_phase_current_ma(current_a, current_b);
-
-        if (overcurrent_watch_update(&watch, largest) != 0u) {
-            /* Back off rather than continuing to apply a duty that has
-             * now proved to be too much for the rest of the hold. */
-            rest_bridge();
-            fault_duty       = amplitude;
-            fault_current_ma = largest;
-            return 0u;
-        }
-
-        apply_vector(angle, amplitude, current_a, current_b);
-    }
-    return 1u;
-}
-
-/* Enable every phase with nothing applied. */
+/* Enable every phase, starting from ground. */
 static void enable_bridge(void)
 {
     for (uint8_t phase = 0u; phase < GATE_DRIVER_PHASE_COUNT; phase++) {
-        gate_driver_set_duty(phase, 500u);
+        gate_driver_set_duty(phase, 0u);
     }
     for (uint8_t phase = 0u; phase < GATE_DRIVER_PHASE_COUNT; phase++) {
         gate_driver_enable_phase(phase);
     }
 }
 
+/* Wait, watching the current, and give up if it stays over the limit.
+ *
+ * Nothing needs re-applying while waiting: a duty written to the timer
+ * stays written. That is the whole advantage of driving the bridge
+ * directly -- the earlier vector-based version had to keep re-applying
+ * its command so the dead-time correction could track the current, and
+ * that feedback path was one of the things that made it unmeasurable.
+ *
+ * A SUSTAINED excursion is what stops a run, not a single reading: the
+ * measurement carries a few counts of noise and a lone switching
+ * transient damages nothing, which is the same argument openloop.c
+ * makes at OPENLOOP_ABORT_CONSECUTIVE_SAMPLES.
+ *
+ * @param milliseconds  how long to wait
+ * @param duty          the duty being applied, recorded if it faults
+ * @return 1 on success, 0 on sustained overcurrent -- the bridge is
+ *         already back at ground when this returns 0 */
+static uint8_t wait_watching_current(uint32_t milliseconds, uint16_t duty)
+{
+    uint32_t start      = HAL_GetTick();
+    uint32_t over_since = 0u;
+    uint8_t  over       = 0u;
+    int32_t  current_a;
+    int32_t  current_b;
+
+    while ((HAL_GetTick() - start) < milliseconds) {
+        sensors_get_currents(&current_a, &current_b);
+
+        int32_t largest = largest_phase_current_ma(current_a, current_b);
+
+        if (largest > ESTIMATE_CURRENT_LIMIT_MA) {
+            if (over == 0u) {
+                over       = 1u;
+                over_since = HAL_GetTick();
+            } else if ((HAL_GetTick() - over_since)
+                           >= ESTIMATE_OVERCURRENT_SUSTAIN_MS) {
+                rest_bridge();
+                fault_duty       = duty;
+                fault_current_ma = largest;
+                return 0u;
+            }
+        } else {
+            over = 0u;
+        }
+    }
+    return 1u;
+}
+
+/* Average one phase's current over a window, watching the limit
+ * throughout.
+ *
+ * @param phase          which phase's sensor to read
+ * @param milliseconds   how long to average over
+ * @param duty           the duty being applied, recorded if it faults
+ * @param average_ma_out where the average is written
+ * @return 1 on success, 0 on sustained overcurrent */
+static uint8_t average_phase_current(uint8_t   phase,
+                                     uint32_t  milliseconds,
+                                     uint16_t  duty,
+                                     int32_t  *average_ma_out)
+{
+    int64_t  total      = 0;
+    uint32_t count      = 0u;
+    uint32_t start      = HAL_GetTick();
+    uint32_t over_since = 0u;
+    uint8_t  over       = 0u;
+    int32_t  current_a;
+    int32_t  current_b;
+
+    while ((HAL_GetTick() - start) < milliseconds) {
+        sensors_get_currents(&current_a, &current_b);
+
+        int32_t largest = largest_phase_current_ma(current_a, current_b);
+
+        if (largest > ESTIMATE_CURRENT_LIMIT_MA) {
+            if (over == 0u) {
+                over       = 1u;
+                over_since = HAL_GetTick();
+            } else if ((HAL_GetTick() - over_since)
+                           >= ESTIMATE_OVERCURRENT_SUSTAIN_MS) {
+                rest_bridge();
+                fault_duty       = duty;
+                fault_current_ma = largest;
+                return 0u;
+            }
+        } else {
+            over = 0u;
+        }
+
+        total += phase_current_ma(phase, current_a, current_b);
+        count++;
+    }
+
+    *average_ma_out = (count > 0u) ? (int32_t)(total / (int32_t)count) : 0;
+    return 1u;
+}
+
 /* ------------------------------------------------------------------
  * Resistance
  * ------------------------------------------------------------------ */
 
-/* Raise the applied voltage until the current reaches a target.
- *
- * Starts from wherever the caller left the duty, so a second call
- * continues upward from the first rather than beginning again -- which
- * both saves time and avoids letting the current fall back to zero
- * between the two measurement points.
- *
- * The angle held throughout is zero. Which angle is used no longer
- * matters for correctness -- see driven_axis_current_ma() -- so zero is
- * as good as any other and keeps this aligned with hold_vector_for's
- * own default.
- *
- * @param target_ma      current to reach, in milliamps
- * @param duty_in_out    duty to start from, updated to the duty reached
- * @param current_out    the driven-axis current actually measured there
- * @return an ESTIMATE_ result code */
-static uint8_t hunt_for_current(int32_t   target_ma,
-                                uint16_t *duty_in_out,
-                                int32_t  *current_out)
-{
-    for (uint16_t duty = *duty_in_out;
-         duty <= RESISTANCE_MAX_DUTY;
-         duty = (uint16_t)(duty + RESISTANCE_DUTY_STEP)) {
-
-        /* Held rather than applied once, so the dead time correction can
-         * settle: it is computed from the measured current, which is
-         * zero at the instant a new duty is first written. Checks the
-         * limit throughout the hold, not just afterward -- see
-         * hold_vector_for() for why that matters on a low resistance
-         * winding. */
-        if (hold_vector_for(0u, duty, RESISTANCE_SETTLE_MS) == 0u) {
-            return ESTIMATE_ERR_OVERCURRENT;
-        }
-
-        uint8_t tripped;
-        int32_t measured = average_current_ma(0u, duty, RESISTANCE_AVERAGE_MS,
-                                              &tripped);
-
-        if (tripped != 0u) {
-            return ESTIMATE_ERR_OVERCURRENT;
-        }
-
-        if (absolute(measured) >= target_ma) {
-            *duty_in_out = duty;
-            *current_out = measured;
-            return ESTIMATE_OK;
-        }
-
-        /* Recorded every step, so that if the ceiling is reached the
-         * report says how far the current actually got rather than
-         * leaving it to be guessed at. */
-        fault_duty       = duty;
-        fault_current_ma = measured;
-    }
-
-    /* The ceiling was reached without the current arriving. Either the
-     * winding is far more resistive than anything expected here, or a
-     * phase is not connected. */
-    return ESTIMATE_ERR_TOO_SMALL;
-}
-
 uint8_t estimate_resistance(motor_t *m,
                             estimate_resistance_result_t *result_out)
 {
-    /* Held for the run so the static helpers can reach the motor. */
     motor = m;
-
-    uint16_t duty = RESISTANCE_DUTY_STEP;
-    int32_t  low_current;
-    int32_t  high_current;
-    uint16_t low_duty;
 
     if (result_out == NULL) {
         return ESTIMATE_ERR_ARGUMENT;
@@ -474,43 +282,74 @@ uint8_t estimate_resistance(motor_t *m,
     fault_duty       = 0u;
     fault_current_ma = 0;
 
-    result_out->resistance_mohm = 0u;
-    result_out->low_duty        = 0u;
-    result_out->high_duty       = 0u;
-    result_out->low_current_ma  = 0;
-    result_out->high_current_ma = 0;
-    result_out->fault_duty      = 0u;
+    result_out->resistance_mohm  = 0u;
+    result_out->low_duty         = 0u;
+    result_out->high_duty        = 0u;
+    result_out->low_current_ma   = 0;
+    result_out->high_current_ma  = 0;
+    result_out->bus_mv           = 0u;
+    result_out->fault_duty       = 0u;
     result_out->fault_current_ma = 0;
 
     enable_bridge();
 
-    uint8_t outcome = hunt_for_current(RESISTANCE_LOW_TARGET_MA,
-                                       &duty, &low_current);
-    if (outcome != ESTIMATE_OK) {
-        gate_driver_disable_all();
-        result_out->fault_duty       = fault_duty;
-        result_out->fault_current_ma = fault_current_ma;
-        return outcome;
+    uint16_t low_duty     = 0u;
+    uint16_t high_duty    = 0u;
+    int32_t  low_current  = 0;
+    int32_t  high_current = 0;
+    uint32_t bus_mv       = 0u;
+    uint8_t  outcome      = ESTIMATE_ERR_TOO_SMALL;
+
+    for (uint16_t duty = RESISTANCE_DUTY_STEP;
+         duty <= RESISTANCE_MAX_DUTY;
+         duty = (uint16_t)(duty + RESISTANCE_DUTY_STEP)) {
+
+        drive_along_axis(duty);
+
+        if (wait_watching_current(RESISTANCE_SETTLE_MS, duty) == 0u) {
+            outcome = ESTIMATE_ERR_OVERCURRENT;
+            break;
+        }
+
+        int32_t measured;
+        if (average_phase_current(GATE_DRIVER_PHASE_A, RESISTANCE_AVERAGE_MS,
+                                  duty, &measured) == 0u) {
+            outcome = ESTIMATE_ERR_OVERCURRENT;
+            break;
+        }
+
+        /* Recorded every step, so a run that reaches the ceiling can
+         * report how far the current actually got rather than leaving
+         * it to be guessed at. */
+        fault_duty       = duty;
+        fault_current_ma = measured;
+
+        if ((low_duty == 0u) && (absolute(measured) >= RESISTANCE_LOW_TARGET_MA)) {
+            low_duty    = duty;
+            low_current = measured;
+
+            /* Read under load rather than before it: the supply sags
+             * once the measurement starts drawing amps, and the voltage
+             * that matters is the one actually available. */
+            bus_mv = sensors_get_bus_mv();
+        }
+
+        if ((low_duty != 0u) && (absolute(measured) >= RESISTANCE_HIGH_TARGET_MA)) {
+            high_duty    = duty;
+            high_current = measured;
+            outcome      = ESTIMATE_OK;
+            break;
+        }
     }
-    low_duty = duty;
 
-    /* The bus is read between the two points rather than before them,
-     * because it sags under the load the measurement itself creates --
-     * particularly with a resistor in series with the supply. Reading it
-     * while current is flowing gives the voltage that is actually
-     * available. */
-    uint32_t bus_millivolts = sensors_get_bus_mv();
-
-    outcome = hunt_for_current(RESISTANCE_HIGH_TARGET_MA,
-                               &duty, &high_current);
-
+    rest_bridge();
     gate_driver_disable_all();
 
-    /* Reported either way: the low point is real even when the high one
-     * never arrived, and knowing where the first one landed is most of
-     * the story when working out why the second did not. */
     result_out->low_duty         = low_duty;
     result_out->low_current_ma   = low_current;
+    result_out->high_duty        = high_duty;
+    result_out->high_current_ma  = high_current;
+    result_out->bus_mv           = bus_mv;
     result_out->fault_duty       = fault_duty;
     result_out->fault_current_ma = fault_current_ma;
 
@@ -521,46 +360,25 @@ uint8_t estimate_resistance(motor_t *m,
     int32_t current_change = high_current - low_current;
 
     if (absolute(current_change) < ESTIMATE_MINIMUM_CURRENT_CHANGE_MA) {
-        result_out->high_duty       = duty;
-        result_out->high_current_ma = high_current;
         return ESTIMATE_ERR_TOO_SMALL;
     }
 
-    /* The slope between the two points.
+    /* The slope between the two points. Both were measured with the same
+     * dead time loss, so the difference between them contains none of
+     * it -- only the extra voltage that produced the extra current.
      *
-     * Both were measured with the same dead time loss, so the difference
-     * between them contains none of it -- only the extra voltage that
-     * produced the extra current.
-     *
-     * NO FACTOR OF TWO-THIRDS HERE
-     *
-     *   An earlier version of this measurement scaled the result by 2/3,
-     *   on the reasoning that current driven into one phase returns
-     *   through the other two in parallel -- true for injecting current
-     *   through a single terminal, with the other two grounded.
-     *
-     *   That is not what happens here. motor_apply_dq always produces a
-     *   BALANCED three-phase voltage set: the three phase voltages sum
-     *   to zero by construction of the inverse Clarke transform, the
-     *   same way the three phase currents of a star winding always do.
-     *   For a balanced drive into a floating-neutral star winding, the
-     *   star point sits at zero by symmetry, and each phase's current is
-     *   simply that phase's own voltage divided by its resistance --
-     *   which means, since the Park/Clarke transform is linear, that the
-     *   q-axis current is just the q-axis voltage divided by R, with no
-     *   correction factor at all. Applying one anyway would have under-
-     *   reported every resistance measured this way by a third. */
+     * Millivolts over milliamps is ohms directly, so the thousand turns
+     * it into milliohms. */
     int32_t voltage_change_mv =
-        (int32_t)((bus_millivolts * (uint32_t)(duty - low_duty))
+        (int32_t)((bus_mv * (uint32_t)(high_duty - low_duty))
                   / GATE_DRIVER_DUTY_SCALE);
 
-    int32_t total_milliohms = (voltage_change_mv * 1000) / current_change;
+    int32_t terminal_mohm = (voltage_change_mv * 1000) / current_change;
 
-    result_out->resistance_mohm = (uint32_t)absolute(total_milliohms);
-    result_out->low_duty        = low_duty;
-    result_out->high_duty       = duty;
-    result_out->low_current_ma  = low_current;
-    result_out->high_current_ma = high_current;
+    /* What the slope measured is the whole path: phase A out, phases B
+     * and C back in parallel, which is R + R/2. Two thirds of it is one
+     * phase. */
+    result_out->resistance_mohm = (uint32_t)absolute((terminal_mohm * 2) / 3);
 
     /* Stored in ohms: the motor holds SI units, the protocol keeps
      * milliohms. */
@@ -573,92 +391,105 @@ uint8_t estimate_resistance(motor_t *m,
  * Inductance
  * ------------------------------------------------------------------ */
 
-/* Apply a voltage pulse along one axis and measure how far the
- * driven-axis current moved.
+/* How long the measuring pulse lasts, in microseconds. A whole number of
+ * control periods, each 1000000 / LOOP_RATE_HZ microseconds. */
+#define PULSE_MICROSECONDS \
+    ((ESTIMATE_PULSE_PERIODS * 1000000u) / LOOP_RATE_HZ)
+
+/* Step the voltage up and measure how fast the current climbs.
  *
- * Timed against the control loop's own iteration counter rather than the
+ * The step is taken from a duty that is ALREADY passing current, not up
+ * from zero, so the dead time removes the same slice of voltage before
+ * and after and cancels in the difference -- the same reasoning the
+ * resistance measurement's two points rest on.
+ *
+ * Timed against the control loop's iteration counter rather than the
  * millisecond tick, because the pulse is a quarter of a millisecond long
- * and the tick has no resolution at that scale. Counting control periods
- * gives exactly 31.25 microseconds each.
+ * and the tick has no resolution at that scale.
  *
- * @param angle            electrical angle to pulse along
- * @param duty             pulse strength, parts per thousand
- * @param change_out       driven-axis current change in milliamps, signed
+ * @param phase       which phase's sensor carries the current
+ * @param hold_duty   duty already applied, and the baseline to step from
+ * @param step        how much to add for the pulse
+ * @param along_axis  1 to pulse along phase A's axis, 0 to pulse across
+ * @param change_out  current change in milliamps, signed
  * @return 1 on success, 0 if the current exceeded the limit */
-static uint8_t apply_pulse(uint16_t angle, uint16_t duty, int32_t *change_out)
+static uint8_t pulse_and_measure(uint8_t   phase,
+                                 uint16_t  hold_duty,
+                                 uint16_t  step,
+                                 uint8_t   along_axis,
+                                 int32_t  *change_out)
 {
     int32_t  current_a;
     int32_t  current_b;
     uint32_t start_iteration;
     uint32_t elapsed;
 
-    /* The current before the pulse. Not assumed to be zero: the rotor is
-     * being held in place by a steady current, and that is the baseline
-     * the change is measured from. Read along the pulse's own axis --
-     * if that axis is not the one the holding current was driven on,
-     * this comes back near zero, which is correct: the holding vector
-     * has no component on an axis orthogonal to it, the same reasoning
-     * driven_axis_current_ma() documents. */
     sensors_get_currents(&current_a, &current_b);
-    int32_t before = driven_axis_current_ma(angle, current_a, current_b);
+    int32_t before = phase_current_ma(phase, current_a, current_b);
 
     start_iteration = loop_get_iteration_count();
 
-    apply_vector(angle, duty, 0, 0);
+    if (along_axis != 0u) {
+        drive_along_axis((uint16_t)(hold_duty + step));
+    } else {
+        drive_across_axis((uint16_t)(hold_duty + step));
+    }
 
-    /* Spin until the loop has run the required number of periods. The
-     * subtraction is correct across the counter's wrap. */
     do {
         elapsed = loop_get_iteration_count() - start_iteration;
     } while (elapsed < ESTIMATE_PULSE_PERIODS);
 
     sensors_get_currents(&current_a, &current_b);
-    int32_t after       = driven_axis_current_ma(angle, current_a, current_b);
-    int32_t peak_phase_ma = largest_phase_current_ma(current_a, current_b);
+    int32_t after = phase_current_ma(phase, current_a, current_b);
 
-    /* Remove the pulse immediately. Every phase back to half duty means
-     * all three terminals sit at the same potential and the current
-     * decays rather than continuing to climb. */
-    for (uint8_t phase = 0u; phase < GATE_DRIVER_PHASE_COUNT; phase++) {
-        gate_driver_set_duty(phase, 500u);
+    /* Back to the holding duty immediately, so the current stops
+     * climbing the moment the measurement is over. */
+    if (along_axis != 0u) {
+        drive_along_axis(hold_duty);
+    } else {
+        drive_across_axis(hold_duty);
     }
 
     *change_out = after - before;
 
-    return (peak_phase_ma > ESTIMATE_CURRENT_LIMIT_MA) ? 0u : 1u;
+    return (largest_phase_current_ma(current_a, current_b)
+                > ESTIMATE_CURRENT_LIMIT_MA) ? 0u : 1u;
 }
 
-/* Measure the inductance along one axis, raising the pulse voltage until
- * the current change is large enough to be meaningful.
+/* Measure the inductance along one axis, raising the pulse until the
+ * current change is large enough to trust.
  *
- * @param angle             electrical angle to pulse along
- * @param hold_duty         current holding the rotor in place, applied
- *                          at electrical angle zero (see
- *                          estimate_inductance())
- * @param inductance_out    result in microhenries
- * @param change_out        the current change that produced it
- * @param duty_out          the pulse duty that was needed
+ * @param phase           which phase's sensor carries the current
+ * @param hold_duty       duty already applied, stepped up from
+ * @param along_axis      1 for phase A's own axis, 0 for across it
+ * @param series_phases_doubled
+ *                        how many phases the current passes through in
+ *                        this topology, times two: 3 for A against B and
+ *                        C in parallel (1.5 phases), 4 for B against C
+ *                        (2 phases). Kept doubled so the division stays
+ *                        in integers.
+ * @param inductance_out  result in microhenries
+ * @param change_out      the current change that produced it
+ * @param step_out        the pulse step that was needed
  * @return an ESTIMATE_ result code */
-static uint8_t measure_axis(uint16_t  angle,
+static uint8_t measure_axis(uint8_t   phase,
                             uint16_t  hold_duty,
+                            uint8_t   along_axis,
+                            uint32_t  series_phases_doubled,
                             uint32_t *inductance_out,
                             int32_t  *change_out,
-                            uint16_t *duty_out)
+                            uint16_t *step_out)
 {
-    uint32_t bus_millivolts = sensors_get_bus_mv();
+    uint32_t bus_mv = sensors_get_bus_mv();
 
-    for (uint32_t i = 0u; i < PULSE_DUTY_COUNT; i++) {
-
-        /* Re-establish the holding current and let the rotor settle back
-         * before each attempt, so every pulse starts from the same
-         * place. */
-        if (hold_vector_for(0u, hold_duty, 50u) == 0u) {
-            return ESTIMATE_ERR_OVERCURRENT;
-        }
+    for (uint32_t i = 0u; i < PULSE_STEP_COUNT; i++) {
 
         int32_t change;
 
-        if (apply_pulse(angle, pulse_duties[i], &change) == 0u) {
+        if (pulse_and_measure(phase, hold_duty, pulse_steps[i],
+                              along_axis, &change) == 0u) {
+            fault_duty       = (uint16_t)(hold_duty + pulse_steps[i]);
+            fault_current_ma = change;
             return ESTIMATE_ERR_OVERCURRENT;
         }
 
@@ -667,35 +498,24 @@ static uint8_t measure_axis(uint16_t  angle,
         }
 
         /* Inductance is the applied voltage times the time, divided by
-         * the current change.
+         * the current change. Millivolts times microseconds over
+         * milliamps gives microhenries directly, with no further
+         * scaling.
          *
-         * THE VOLTAGE ACTUALLY APPLIED IS A STEP, NOT AN ABSOLUTE VALUE
-         *
-         *   apply_pulse() commands pulse_duties[i] outright -- it does
-         *   not add to whatever was there before. The holding vector is
-         *   driven at electrical angle zero, so it contributes
-         *   hold_duty's worth of voltage to a pulse that shares that
-         *   same angle, and nothing to one ninety degrees away (a
-         *   vector has no component on an axis orthogonal to it, same
-         *   as the current it produces). Subtracting that prior
-         *   contribution is what turns pulse_duties[i] into the actual
-         *   step the winding saw. Skipping this would overstate the
-         *   voltage for the angle-zero measurement specifically, by
-         *   double-counting the four parts per thousand already being
-         *   applied to hold the rotor there. */
-        uint16_t prior_duty_on_axis = (angle == 0u) ? hold_duty : 0u;
+         * Only the STEP counts as the applied voltage: the holding duty
+         * was already there before the pulse and is still there after,
+         * so it drives no change. */
+        uint32_t step_mv =
+            (bus_mv * pulse_steps[i]) / GATE_DRIVER_DUTY_SCALE;
 
-        uint32_t applied_mv =
-            (bus_millivolts * (uint32_t)(pulse_duties[i] - prior_duty_on_axis))
-            / GATE_DRIVER_DUTY_SCALE;
+        uint32_t series_inductance_uh =
+            (step_mv * PULSE_MICROSECONDS) / (uint32_t)absolute(change);
 
-        uint32_t pulse_microseconds =
-            (ESTIMATE_PULSE_PERIODS * 1000000u) / LOOP_RATE_HZ;
-
-        *inductance_out = (applied_mv * pulse_microseconds)
-                          / (uint32_t)absolute(change);
-        *change_out = change;
-        *duty_out   = pulse_duties[i];
+        /* Divide out the topology: the pulse passed through more than
+         * one phase's worth of winding. */
+        *inductance_out = (series_inductance_uh * 2u) / series_phases_doubled;
+        *change_out     = change;
+        *step_out       = pulse_steps[i];
 
         return ESTIMATE_OK;
     }
@@ -708,23 +528,15 @@ uint8_t estimate_inductance(motor_t *m,
 {
     motor = m;
 
-    /* Current used to hold the rotor aligned while the pulses happen.
-     *
-     * Kept low because it counts against the same current limit the
-     * pulses do: a hold that already draws two amps leaves very little
-     * headroom before a pulse trips the limit. Four parts per thousand
-     * is around one amp here, enough to keep a small rotor from turning
-     * during a quarter-millisecond pulse. Matches pulse_duties[0], so
-     * the first pulse attempt at electrical angle zero is a genuine
-     * zero-volt step rather than a wasted attempt -- see measure_axis(). */
-    const uint16_t hold_duty = 4u;
-
     if (result_out == NULL) {
         return ESTIMATE_ERR_ARGUMENT;
     }
     if (loop_is_running() == 0u) {
         return ESTIMATE_ERR_NOT_READY;
     }
+
+    fault_duty       = 0u;
+    fault_current_ma = 0;
 
     result_out->inductance_d_uh     = 0u;
     result_out->inductance_q_uh     = 0u;
@@ -735,33 +547,54 @@ uint8_t estimate_inductance(motor_t *m,
 
     enable_bridge();
 
-    /* Pull the rotor into line with electrical angle zero and let it
-     * settle. Every pulse below is measured relative to this position. */
-    if (hold_vector_for(0u, hold_duty, ESTIMATE_HOLD_MS) == 0u) {
+    /* Pull the rotor into line with phase A's axis and let it settle.
+     * The field points where the rotor is asked to go, so once it
+     * arrives there is no torque left and it stays put. */
+    drive_along_axis(ALIGN_DUTY);
+    if (wait_watching_current(ALIGN_MS, ALIGN_DUTY) == 0u) {
         gate_driver_disable_all();
         return ESTIMATE_ERR_OVERCURRENT;
     }
 
     /* Along the magnet axis. The pulse points the same way the rotor is
      * already aligned, so it produces no torque and the rotor does not
-     * move. */
-    uint8_t outcome = measure_axis(0u, hold_duty,
+     * move. Current passes through A and then B and C in parallel:
+     * 1.5 phases, so 3 halves. */
+    uint8_t outcome = measure_axis(GATE_DRIVER_PHASE_A, ALIGN_DUTY, 1u, 3u,
                                    &result_out->inductance_d_uh,
                                    &result_out->d_current_change_ma,
                                    &result_out->duty_used);
     if (outcome != ESTIMATE_OK) {
+        rest_bridge();
         gate_driver_disable_all();
         return outcome;
     }
 
-    /* Across the magnet axis. This direction does produce torque, but
-     * the pulse lasts a quarter of a millisecond and the rotor's inertia
-     * means it barely begins to move before the pulse is over. */
-    outcome = measure_axis(QUARTER_TURN, hold_duty,
+    /* Across the magnet axis: phase A floated so the current has only
+     * one path, B to C, ninety electrical degrees from where the rotor
+     * is sitting.
+     *
+     * That direction produces maximum torque, so the pre-hold is kept to
+     * a couple of milliseconds -- long enough to give the pulse a
+     * current to step from, far too short for the rotor to accelerate
+     * anywhere that matters. */
+    rest_bridge();
+    gate_driver_disable_phase(GATE_DRIVER_PHASE_A);
+
+    drive_across_axis(ALIGN_DUTY);
+    if (wait_watching_current(ACROSS_PREHOLD_MS, ALIGN_DUTY) == 0u) {
+        gate_driver_disable_all();
+        return ESTIMATE_ERR_OVERCURRENT;
+    }
+
+    /* Current passes through B and then C: 2 phases, so 4 halves. */
+    uint16_t across_step = 0u;
+    outcome = measure_axis(GATE_DRIVER_PHASE_B, ALIGN_DUTY, 0u, 4u,
                            &result_out->inductance_q_uh,
                            &result_out->q_current_change_ma,
-                           &result_out->duty_used);
+                           &across_step);
 
+    rest_bridge();
     gate_driver_disable_all();
 
     if (outcome != ESTIMATE_OK) {
