@@ -32,6 +32,34 @@ static const struct {
  * motor pointer. */
 static gate_driver_t *self;
 
+/* Dead time to correct for, in nanoseconds: the gate driver's own delay
+ * plus the transistors' turn-on time through the 10 ohm gate resistors.
+ * Measured on this board rather than taken from a datasheet. */
+#define DEAD_TIME_NS 750u
+
+/* The switching period in nanoseconds. The timer counts to 1499 and back
+ * at 96 MHz, so 2998 counts, which is 31229 nanoseconds. */
+#define PERIOD_NS 31229u
+
+/* Dead time as parts per thousand of the switching period. Derived
+ * rather than written as a constant, so changing either figure keeps it
+ * correct. With the values above this comes to 24. */
+#define DEAD_TIME_PER_MILLE ((DEAD_TIME_NS * 1000u) / PERIOD_NS)
+
+/* Current at which the dead time correction reaches full value, in
+ * milliamps. Below this it is scaled down in proportion.
+ *
+ * A plain sign test fails here. The current sensor resolves about 40
+ * milliamps per count and carries a few counts of noise, so a reading
+ * near zero changes sign at random, and the correction would then flip
+ * between plus and minus a full dead time -- a swing of 48 parts per
+ * thousand, which is larger than the whole command. Scaling through the
+ * zero crossing turns a reversal into a proportionally small wobble. */
+#define DEAD_TIME_FULL_MA 800
+
+/* Milliamps to amps, and millivolts to volts. */
+#define MILLI_TO_UNIT 0.001f
+
 /* ------------------------------------------------------------------
  * Duty conversion
  * ------------------------------------------------------------------ */
@@ -206,4 +234,102 @@ uint8_t gate_driver_is_enabled(uint8_t phase)
         return 0u;
     }
     return self->phase_enabled[phase];
+}
+
+uint8_t gate_driver_apply_voltage(uint8_t  phase,
+                                  float    phase_voltage,
+                                  uint16_t bus_mv,
+                                  int32_t  phase_current_ma)
+{
+    if (phase >= GATE_DRIVER_PHASE_COUNT) {
+        return 0u;
+    }
+
+    /* A bridge cannot drive a phase below the negative rail, so the
+     * demand is applied as a deviation either side of half duty. At half
+     * on all three phases the terminals sit at the same potential and no
+     * current flows, which is why half is the resting point. */
+    int32_t duty = (int32_t)(GATE_DRIVER_DUTY_SCALE / 2u);
+
+    if (bus_mv == 0u) {
+        /* Nothing sensible can be computed without a bus measurement,
+         * and dividing by it would fault. Resting duty applies no
+         * voltage, which is the safe answer. */
+        return gate_driver_set_duty(phase, (uint16_t)duty);
+    }
+
+    /* Express the demand as a fraction of the bus, in the same parts per
+     * thousand as the duty. Deriving it from the measured bus rather
+     * than a nominal figure means the voltage actually applied stays
+     * correct as the supply sags. */
+    int32_t commanded = (int32_t)((phase_voltage
+                                   * (float)GATE_DRIVER_DUTY_SCALE)
+                                  / ((float)bus_mv * MILLI_TO_UNIT));
+    duty += commanded;
+
+    /* Dead time correction.
+     *
+     * Current flowing OUT of the terminal -- negative here -- holds the
+     * phase toward the positive rail during the gap, so it spent longer
+     * high than commanded and the correction is downward. Current
+     * flowing in does the opposite.
+     *
+     * Scaled in proportion below the threshold rather than switched on a
+     * sign test, so that noise near a zero crossing produces a small
+     * wobble instead of a full reversal. */
+    int32_t scaled = phase_current_ma;
+
+    if (scaled > DEAD_TIME_FULL_MA) {
+        scaled = DEAD_TIME_FULL_MA;
+    } else if (scaled < -DEAD_TIME_FULL_MA) {
+        scaled = -DEAD_TIME_FULL_MA;
+    }
+
+    int32_t correction = ((int32_t)DEAD_TIME_PER_MILLE * scaled)
+                         / DEAD_TIME_FULL_MA;
+
+    /* The correction may never exceed what was actually commanded.
+     *
+     * WHY THIS BOUND IS NOT OPTIONAL
+     *
+     *   The correction takes its sign from the measured current, and the
+     *   voltage it admits sustains that current. That is a loop, and
+     *   whether it is stable depends on how large the correction is next
+     *   to the command.
+     *
+     *   On this board the full correction is 24 parts per thousand of
+     *   the bus -- roughly 290 millivolts, which across a 54 milliohm
+     *   path is over five amps. So on a low resistance winding the
+     *   correction alone can drive far more current than any sensible
+     *   command, and once current flows in either direction the
+     *   correction holds it there. The motor draws heavily, produces no
+     *   useful torque, and which way it latched is arbitrary.
+     *
+     *   Bounding the correction by the commanded value breaks the loop.
+     *   It can still restore voltage the dead time removed, which is its
+     *   entire purpose, but it can no longer create voltage that was
+     *   never asked for -- so with nothing commanded, nothing happens.
+     */
+    int32_t bound = (commanded < 0) ? -commanded : commanded;
+
+    if (correction > bound) {
+        correction = bound;
+    } else if (correction < -bound) {
+        correction = -bound;
+    }
+
+    duty += correction;
+
+    /* Clamped here too, before gate_driver_set_duty's own clamp to
+     * GATE_DRIVER_DUTY_MAXIMUM. That clamp alone would still produce a
+     * safe final duty, but duty is signed here and set_duty's parameter
+     * is not -- an unclamped negative value would wrap to a huge
+     * positive one on the cast below instead of saturating to zero. */
+    if (duty < 0) {
+        duty = 0;
+    } else if (duty > (int32_t)GATE_DRIVER_DUTY_SCALE) {
+        duty = (int32_t)GATE_DRIVER_DUTY_SCALE;
+    }
+
+    return gate_driver_set_duty(phase, (uint16_t)duty);
 }

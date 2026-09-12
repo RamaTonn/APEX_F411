@@ -1,6 +1,6 @@
 #include "estimate.h"
 
-#include "control.h"
+#include "loop.h"
 #include "gate_driver.h"
 #include "main.h"
 #include "motor.h"
@@ -132,7 +132,7 @@ static int32_t average_current_ma(uint16_t angle,
     int32_t  current_b;
 
     while ((HAL_GetTick() - start) < milliseconds) {
-        control_get_currents(&current_a, &current_b);
+        sensors_get_currents(&current_a, &current_b);
 
         /* The vector is re-applied while averaging, for the same reason
          * hold_vector_for exists: the dead time correction is computed
@@ -174,7 +174,7 @@ static void hold_vector_for(uint16_t angle,
     int32_t  current_b;
 
     while ((HAL_GetTick() - start) < milliseconds) {
-        control_get_currents(&current_a, &current_b);
+        sensors_get_currents(&current_a, &current_b);
         apply_vector(angle, amplitude, current_a, current_b);
     }
 }
@@ -251,7 +251,7 @@ uint8_t estimate_resistance(motor_t *m,
     if (result_out == NULL) {
         return ESTIMATE_ERR_ARGUMENT;
     }
-    if (control_is_running() == 0u) {
+    if (loop_is_running() == 0u) {
         return ESTIMATE_ERR_NOT_READY;
     }
 
@@ -342,20 +342,20 @@ static uint8_t apply_pulse(uint16_t angle, uint16_t duty, int32_t *change_out)
     /* The current before the pulse. Not assumed to be zero: the rotor is
      * being held in place by a steady current, and that is the baseline
      * the change is measured from. */
-    control_get_currents(&current_a, &current_b);
+    sensors_get_currents(&current_a, &current_b);
     int32_t before = current_a;
 
-    start_iteration = control_get_iteration_count();
+    start_iteration = loop_get_iteration_count();
 
     apply_vector(angle, duty, 0, 0);
 
     /* Spin until the loop has run the required number of periods. The
      * subtraction is correct across the counter's wrap. */
     do {
-        elapsed = control_get_iteration_count() - start_iteration;
+        elapsed = loop_get_iteration_count() - start_iteration;
     } while (elapsed < ESTIMATE_PULSE_PERIODS);
 
-    control_get_currents(&current_a, &current_b);
+    sensors_get_currents(&current_a, &current_b);
     int32_t after = current_a;
 
     /* Remove the pulse immediately. Every phase back to half duty means
@@ -417,7 +417,7 @@ static uint8_t measure_axis(uint16_t  angle,
             (bus_millivolts * pulse_duties[i]) / GATE_DRIVER_DUTY_SCALE;
 
         uint32_t pulse_microseconds =
-            (ESTIMATE_PULSE_PERIODS * 1000000u) / CONTROL_LOOP_RATE_HZ;
+            (ESTIMATE_PULSE_PERIODS * 1000000u) / LOOP_RATE_HZ;
 
         *inductance_out = (applied_mv * pulse_microseconds)
                           / (uint32_t)absolute(change);
@@ -450,7 +450,7 @@ uint8_t estimate_inductance(motor_t *m,
     if (result_out == NULL) {
         return ESTIMATE_ERR_ARGUMENT;
     }
-    if (control_is_running() == 0u) {
+    if (loop_is_running() == 0u) {
         return ESTIMATE_ERR_NOT_READY;
     }
 

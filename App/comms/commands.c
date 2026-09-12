@@ -3,7 +3,7 @@
 #include "apex_board.h"
 #include "cobs.h"
 #include "calibration.h"
-#include "control.h"
+#include "loop.h"
 #include "crc16.h"
 #include "encoder.h"
 #include "estimate.h"
@@ -162,7 +162,7 @@ static void command_sense(const protocol_args_t *args)
     int32_t current_b;
 
     (void)args;
-    control_get_currents(&current_a, &current_b);
+    sensors_get_currents(&current_a, &current_b);
 
     protocol_reply_begin(PROTOCOL_STATUS_OK, "sense");
     protocol_reply_int("ia_ma", current_a);
@@ -311,17 +311,17 @@ static void command_loop(const protocol_args_t *args)
     int32_t current_b;
 
     (void)args;
-    control_get_currents(&current_a, &current_b);
+    sensors_get_currents(&current_a, &current_b);
 
     protocol_reply_begin(PROTOCOL_STATUS_OK, "loop");
     /* init separates "never set up" from "set up but stopped". A zero
      * here means the timer is not triggering the ADC, and nothing that
      * depends on current measurement will work. */
-    protocol_reply_uint("init",  control_is_initialised());
-    protocol_reply_uint("run",   control_is_running());
-    protocol_reply_uint("iters", control_get_iteration_count());
-    protocol_reply_uint("over",  control_get_overrun_count());
-    protocol_reply_uint("us",    control_get_duration_us());
+    protocol_reply_uint("init",  loop_is_initialised());
+    protocol_reply_uint("run",   loop_is_running());
+    protocol_reply_uint("iters", loop_get_iteration_count());
+    protocol_reply_uint("over",  loop_get_overrun_count());
+    protocol_reply_uint("us",    loop_get_duration_us());
     protocol_reply_int("ia_ma",  current_a);
     protocol_reply_int("ib_ma",  current_b);
     protocol_reply_end();
@@ -420,7 +420,7 @@ static void command_spinstat(const protocol_args_t *args)
 
     openloop_get_state(&frequency, &amplitude, &electrical_angle, &aborted);
     openloop_get_currents(&peak_current, &abort_current);
-    control_get_currents(&current_a, &current_b);
+    sensors_get_currents(&current_a, &current_b);
     (void)encoder_read_angle(&encoder_angle);
 
     protocol_reply_begin(PROTOCOL_STATUS_OK, "spinstat");
@@ -580,7 +580,7 @@ static void command_telcfg(const protocol_args_t *args)
     /* The resulting sample rate, so the caller does not have to work it
      * out from the loop rate and the divider. */
     protocol_reply_uint("hz",
-        CONTROL_LOOP_RATE_HZ / telemetry_get_divider());
+        LOOP_RATE_HZ / telemetry_get_divider());
     protocol_reply_end();
 }
 

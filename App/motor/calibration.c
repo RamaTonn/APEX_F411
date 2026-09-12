@@ -1,7 +1,7 @@
 #include "calibration.h"
 
 #include "motor.h"
-#include "control.h"
+#include "loop.h"
 #include "encoder.h"
 #include "gate_driver.h"
 #include "main.h"
@@ -102,7 +102,7 @@ static void hold_vector(uint16_t angle, uint16_t amplitude)
     int32_t current_a;
     int32_t current_b;
 
-    control_get_currents(&current_a, &current_b);
+    sensors_get_currents(&current_a, &current_b);
 
     /* The whole vector goes on the q axis. Which physical axis that is
      * depends on where electrical zero sits -- which is precisely what
@@ -131,7 +131,7 @@ static uint8_t current_too_high(int32_t *peak_out)
     int32_t current_a;
     int32_t current_b;
 
-    control_get_currents(&current_a, &current_b);
+    sensors_get_currents(&current_a, &current_b);
 
     int32_t largest = absolute(current_a);
     if (absolute(current_b) > largest) {
@@ -254,7 +254,7 @@ uint8_t calibration_run(motor_t              *m,
 
     /* The currents this routine watches come from the control loop. With
      * it stopped they are stale, and a stall would go unnoticed. */
-    if (control_is_running() == 0u) {
+    if (loop_is_running() == 0u) {
         return CALIBRATION_ERR_NOT_READY;
     }
 

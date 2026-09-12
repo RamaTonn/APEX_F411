@@ -24,7 +24,9 @@
  *     board/     this file, and the unit conventions
  *     drivers/   the peripherals: encoder, bridge, sensors, USB
  *     comms/     framing, protocols, and the command handlers
- *     control/   the control loop and what runs inside it
+ *     control/   the PWM-rate loop (loop.c) and the math building blocks
+ *                -- PID, filters -- that the modes running inside it
+ *                are composed from
  *     motion/    things that drive the motor: spin, calibrate, measure
  *     monitor/   telemetry and the protection supervisor
  */
@@ -44,7 +46,9 @@
 #include "sensors.h"
 
 #include "motor.h"
-#include "control.h"
+#include "pid.h"
+#include "filter.h"
+#include "loop.h"
 
 #include "cobs.h"
 #include "crc16.h"

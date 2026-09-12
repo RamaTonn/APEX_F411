@@ -207,25 +207,23 @@ void motor_get_dq_currents(const motor_t *m,
 
 /**
  * Apply a rotor-frame voltage demand to the bridge: inverse Park, then
- * inverse Clarke, then map each phase voltage to a duty and drive it.
+ * inverse Clarke, then hand each phase voltage to the gate driver.
  *
  * The one call that turns a controller's output into switching. A current
  * loop hands it two PI outputs; open-loop drive hands it zero on d and
  * the desired amplitude on q.
  *
- * Each phase duty is half duty plus that phase's voltage as a fraction of
- * the bus, so at zero volts all three sit at half and no current flows.
- *
- * Dead-time correction is applied here for now, which is why the phase
- * currents are needed. It moves into the bridge driver when that is
- * refactored, and these two arguments go with it.
+ * The phase currents are passed straight through to
+ * gate_driver_apply_voltage(), which is what actually turns a voltage
+ * into a duty and applies dead-time compensation -- see gate_driver.h
+ * for why that correction needs them.
  *
  * @param m             the motor
  * @param v_d           d-axis voltage demand, volts
  * @param v_q           q-axis voltage demand, volts
  * @param angle_rad     the electrical angle to transform against
- * @param current_a_ma  phase A current, for dead-time correction
- * @param current_b_ma  phase B current, for dead-time correction
+ * @param current_a_ma  phase A current, for dead-time compensation
+ * @param current_b_ma  phase B current, for dead-time compensation
  * @param bus_mv        measured bus voltage, millivolts
  */
 void motor_apply_dq(motor_t *m,

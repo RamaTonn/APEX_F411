@@ -1,13 +1,13 @@
 #include "protection.h"
 
 #include "apex_board.h"
-#include "control.h"
+#include "loop.h"
 #include "gate_driver.h"
 #include "main.h"
 #include "sensors.h"
 
 /* No scaling constants here on purpose. Currents arrive from
- * control_get_currents() already in milliamps with the zero-current
+ * sensors_get_currents() already in milliamps with the zero-current
  * reference subtracted, and bus voltage arrives from sensors_get_bus_mv()
  * already in millivolts. A supervisor that re-derived either from raw
  * counts would be a second place to get the shunt value or the divider
@@ -74,10 +74,10 @@ static uint8_t read_currents(int32_t *current_a, int32_t *current_b)
     /* Already sampled at the exact PWM instant by the control loop, so
      * this is a snapshot read rather than a conversion. If the loop is
      * not running these values are stale, which is why that is checked. */
-    if (control_is_running() == 0u) {
+    if (loop_is_running() == 0u) {
         return 0u;
     }
-    control_get_currents(current_a, current_b);
+    sensors_get_currents(current_a, current_b);
     return 1u;
 }
 
@@ -109,7 +109,7 @@ uint8_t protection_init(void)
 
     /* Start from a known-safe state: bridge off, error LED off. The
      * zero-current references this used to measure are now established
-     * by control_init(), which must therefore run first. */
+     * by loop_init(), which must therefore run first. */
     gate_driver_disable_all();
     led2(0);
     return 1u;

@@ -159,4 +159,38 @@ uint16_t gate_driver_get_duty(uint8_t phase);
  */
 uint8_t gate_driver_is_enabled(uint8_t phase);
 
+/**
+ * Convert a voltage demand for one phase into a duty and drive it,
+ * including dead-time compensation.
+ *
+ * A bridge cannot drive a phase below the negative rail, so the demand
+ * is applied as a deviation either side of half duty -- at half on all
+ * three phases the terminals sit at the same potential and no current
+ * flows, which is why half is the resting point. The demand is expressed
+ * as a fraction of the measured bus rather than a nominal voltage, so
+ * the voltage actually applied stays correct as the supply sags.
+ *
+ * Dead-time compensation restores the fraction of each switching period
+ * that the driver's own turn-on delay and dead time otherwise steal from
+ * the commanded voltage. It is scaled down below a threshold current
+ * rather than switched on a sign test, so noise near a zero crossing
+ * produces a small wobble instead of the correction flipping a full dead
+ * time from one sign to the other. The correction is also never allowed
+ * to exceed what was actually commanded -- see gate_driver.c for why
+ * that bound is load-bearing rather than a nicety.
+ *
+ * @param phase             GATE_DRIVER_PHASE_A, _B or _C
+ * @param phase_voltage     what this phase should produce, in volts,
+ *                          either side of the resting point
+ * @param bus_mv            measured bus voltage, millivolts
+ * @param phase_current_ma  this phase's current in milliamps, signed;
+ *                          positive means flowing into the terminal, used
+ *                          only for dead-time compensation
+ * @return 1 on success, 0 if the phase index was invalid
+ */
+uint8_t gate_driver_apply_voltage(uint8_t  phase,
+                                  float    phase_voltage,
+                                  uint16_t bus_mv,
+                                  int32_t  phase_current_ma);
+
 #endif /* GATE_DRIVER_H_ */

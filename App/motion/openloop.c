@@ -1,6 +1,6 @@
 #include "openloop.h"
 
-#include "control.h"
+#include "loop.h"
 #include "gate_driver.h"
 #include "main.h"
 #include "motor.h"
@@ -27,7 +27,7 @@
  * frequency.
  *
  * A full revolution is 2^32 accumulator units and there are
- * CONTROL_LOOP_RATE_HZ steps per second, so one hertz advances by 2^32
+ * LOOP_RATE_HZ steps per second, so one hertz advances by 2^32
  * divided by the loop rate each step. 4294967296 over 32000 is 134217.7,
  * so this rounds down; the resulting frequency error is under one part
  * in 100000. */
@@ -250,7 +250,7 @@ void openloop_init(motor_t *m)
     consecutive_over_limit = 0u;
     abort_limit_ma         = OPENLOOP_DEFAULT_CURRENT_LIMIT_MA;
 
-    control_set_function(openloop_control_step);
+    loop_set_function(openloop_control_step);
 }
 
 /* Turn a frequency in hertz into an accumulator increment, clamping on
@@ -287,7 +287,7 @@ uint8_t openloop_start(uint16_t frequency_hz, uint16_t amplitude)
      * be called and the bridge would sit at whatever duty it was left
      * at -- enabled but static, which on a low resistance winding means
      * a steady DC current through one phase. */
-    if (control_is_running() == 0u) {
+    if (loop_is_running() == 0u) {
         return 0u;
     }
 

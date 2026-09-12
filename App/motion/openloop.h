@@ -118,8 +118,8 @@
 /**
  * Prepare the module. Does not move anything.
  *
- * Must be called after control_init(), because it installs itself as the
- * control loop's function.
+ * Must be called after loop_init(), because it installs itself as the
+ * loop's function.
  */
 void openloop_init(motor_t *m);
 

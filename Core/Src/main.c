@@ -48,6 +48,7 @@ static motor_t motor;
 static encoder_t encoder;
 static gate_driver_t gate_driver;
 static sensors_t sensors;
+static loop_t loop;
 uint32_t ticks = 0;
 float sin_ang = 0;
 /* USER CODE END PV */
@@ -112,41 +113,41 @@ int main(void)
 	 * It only needs the encoder's address, not its contents yet.
 	 *
 	 * encoder_init next, before anything talks to the sensor over SPI --
-	 * control_init below primes the encoder pipeline as part of its own
+	 * loop_init below primes the encoder pipeline as part of its own
 	 * setup, so the chip select idle state and the sensor's power-up
 	 * error flags must already be sorted out by the time that runs.
 	 *
 	 * sensors_start next, because it starts the ADC running with the
-	 * regular conversion group. The injected group that control_init arms
+	 * regular conversion group. The injected group that loop_init arms
 	 * preempts that group, so the ADC must already be going.
 	 *
-	 * gate_driver_init before control_init, so the bridge is explicitly
+	 * gate_driver_init before loop_init, so the bridge is explicitly
 	 * disabled before the control interrupt starts firing -- rather than
 	 * relying on the GPIO reset state being what we assume.
 	 *
-	 * control_init after all three. It measures the no-current sensor
+	 * loop_init after all three. It measures the no-current sensor
 	 * references, which needs the ADC running and the bridge off, and it
 	 * arms the interrupt that everything downstream runs inside.
 	 *
-	 * protection_init after control_init, since the supervisor compares
-	 * against the references control_init established.
+	 * protection_init after loop_init, since the supervisor compares
+	 * against the references loop_init established.
 	 *
-	 * openloop_init installs itself as the control function, so it must
-	 * follow control_init and precede control_start.
+	 * openloop_init installs itself as the loop function, so it must
+	 * follow loop_init and precede loop_start.
 	 */
 	motor_init(&motor, &encoder);
 	encoder_init(&encoder);
 
 	sensors_start(&sensors);
 	gate_driver_init(&gate_driver);
-	control_init(&motor);
+	loop_init(&loop, &motor);
 
 	protection_init();
 	openloop_init(&motor);
 	telemetry_init(&motor);
 	commands_init(&motor);
 
-	control_start();
+	loop_start();
 
 	protocol_init();
 
