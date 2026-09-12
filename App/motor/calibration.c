@@ -386,8 +386,8 @@ uint8_t calibration_run(motor_t              *m,
      * a failed run leaves whatever was configured before, rather than
      * replacing it with a measurement known to be bad. */
     (void)motor_set_pole_pairs(motor, result_out->pole_pairs);
-    motor_set_offset(motor, result_out->offset_counts);
-    motor_set_direction(motor, result_out->direction_forward);
+    encoder_set_offset(motor->encoder, result_out->offset_counts);
+    encoder_set_direction(motor->encoder, result_out->direction_forward);
 
     outcome = CALIBRATION_OK;
 

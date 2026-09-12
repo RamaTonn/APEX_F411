@@ -69,7 +69,7 @@ static uint16_t compute_electrical_angle(const motor_t *m)
      * one cycle. The mask is the modulo, since the encoder scale is a
      * power of two. The product reaches at most 16383 times 30, well
      * inside 32 bits. */
-    uint32_t within_cycle = ((uint32_t)m->e->mechanical_angle
+    uint32_t within_cycle = ((uint32_t)m->encoder->mechanical_angle
                              * (uint32_t)m->pole_pairs)
                             & (MOTOR_ENCODER_COUNTS - 1u);
 
@@ -94,7 +94,7 @@ void motor_init(motor_t *m, encoder_t *e)
     m->electrical_angle  = 0u;
     m->reading_enabled   = 0u;
 
-    m->e = e;
+    m->encoder = e;
 
     m->resistance_ohm    = 0.0f;
     m->inductance_d_h    = 0.0f;
@@ -126,26 +126,6 @@ uint8_t motor_get_pole_pairs(const motor_t *m)
     return m->pole_pairs;
 }
 
-void motor_set_offset(motor_t *m, uint16_t offset_counts)
-{
-    encoder_set_offset(m->e, offset_counts);
-}
-
-uint16_t motor_get_offset(const motor_t *m)
-{
-    return encoder_get_offset(m->e);
-}
-
-void motor_set_direction(motor_t *m, uint8_t forward)
-{
-    encoder_set_direction(m->e, (forward != 0u) ? 1u : 0u);
-}
-
-uint8_t motor_get_direction(const motor_t *m)
-{
-    return encoder_get_direction(m->e);
-}
-
 /* ------------------------------------------------------------------
  * Rotor angle
  * ------------------------------------------------------------------ */
@@ -156,7 +136,7 @@ uint8_t motor_update(motor_t *m)
         return 0u;
     }
 
-    if (encoder_capture(m->e) == 0u) {
+    if (encoder_capture(m->encoder) == 0u) {
         /* The previous electrical angle is kept. Substituting zero would
          * look like the rotor jumping to the origin, and a loop acting
          * on that would apply a large correction to something that
@@ -172,17 +152,6 @@ uint8_t motor_update(motor_t *m)
 uint16_t motor_get_electrical_angle(const motor_t *m)
 {
     return m->electrical_angle;
-}
-
-uint16_t motor_get_raw_angle(const motor_t *m)
-{
-    return encoder_get_raw_count(m->e);
-}
-
-void motor_prime(motor_t *m)
-{
-    (void)m;
-    encoder_prime_pipeline();
 }
 
 void motor_set_reading_enabled(motor_t *m, uint8_t enabled)

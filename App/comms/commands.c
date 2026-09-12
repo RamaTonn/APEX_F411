@@ -779,13 +779,13 @@ static void command_comm(const protocol_args_t *args)
     protocol_reply_begin(PROTOCOL_STATUS_OK, "comm");
     protocol_reply_uint("on",    motor_reading_enabled(motor));
     protocol_reply_uint("poles", motor_get_pole_pairs(motor));
-    protocol_reply_uint("dir",   motor_get_direction(motor));
+    protocol_reply_uint("dir",   encoder_get_direction(motor->encoder));
     protocol_reply_int("off_mrad",
-        units_counts_to_mrad(motor_get_offset(motor)));
+        units_counts_to_mrad(encoder_get_offset(motor->encoder)));
     /* Shaft position and rotor electrical angle, both in milliradians of
      * their own kind of revolution. */
     protocol_reply_int("pos_mrad",
-        units_counts_to_mrad(motor_get_raw_angle(motor)));
+        units_counts_to_mrad(encoder_get_raw_count(motor->encoder)));
     protocol_reply_int("eangle_mrad",
         units_angle_to_mrad(motor_get_electrical_angle(motor)));
     protocol_reply_end();

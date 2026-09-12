@@ -1,5 +1,6 @@
 #include "control.h"
 
+#include "encoder.h"
 #include "motor.h"
 #include "main.h"
 #include "telemetry.h"
@@ -335,7 +336,7 @@ uint8_t control_init(motor_t *m)
 
     /* Flush the encoder pipeline so the first angle the loop sees is a
      * real measurement rather than whatever the sensor had queued. */
-    motor_prime(motor);
+    encoder_prime_pipeline();
 
     initialised = 1u;
     return 1u;

@@ -76,7 +76,7 @@ typedef struct {
      * OFF BY DEFAULT -- see motor_set_reading_enabled() for why. */
     volatile uint8_t reading_enabled;
 
-    encoder_t* e;
+    encoder_t* encoder;
 
     /* --- Live dq currents and voltages, refreshed once per control period ---
          *
@@ -122,42 +122,14 @@ uint8_t motor_set_pole_pairs(motor_t *m, uint8_t pole_pairs);
  */
 uint8_t motor_get_pole_pairs(const motor_t *m);
 
-/**
- * Set the encoder reading that corresponds to electrical zero.
- *
- * Forwards to the motor's encoder -- see encoder_set_offset(). Kept here
- * too because calibration only ever knows about the motor it is
- * calibrating, not the encoder underneath it.
- *
- * @param m              the motor
- * @param offset_counts  any value; an offset is an angle, so values past
- *                       one revolution wrap rather than being rejected
- */
-void motor_set_offset(motor_t *m, uint16_t offset_counts);
-
-/**
- * @param m  the motor
- * @return the offset in encoder counts, 0..16383
- */
-uint16_t motor_get_offset(const motor_t *m);
-
-/**
- * Choose whether increasing encoder counts mean forward rotation.
- *
- * @param m        the motor
- * @param forward  non-zero if counting up is forward, zero if the encoder
- *                 counts against the winding order
- */
-void motor_set_direction(motor_t *m, uint8_t forward);
-
-/**
- * @param m  the motor
- * @return 1 if rising counts are treated as forward
- */
-uint8_t motor_get_direction(const motor_t *m);
-
 /* ==================================================================
  * Rotor angle
+ *
+ * The offset and direction that used to live here now belong to the
+ * encoder -- see motor_t::encoder and encoder_set_offset() /
+ * encoder_set_direction(). A caller that already has a motor_t* reaches
+ * them as encoder_set_offset(m->encoder, ...): motor_t holds the pointer,
+ * it doesn't re-expose the encoder's own API.
  * ================================================================== */
 
 /**
@@ -183,20 +155,6 @@ uint8_t motor_update(motor_t *m);
  * @return the rotor's electrical angle, 0..65535
  */
 uint16_t motor_get_electrical_angle(const motor_t *m);
-
-/**
- * @param m  the motor
- * @return the shaft angle as the encoder reported it, 0..16383
- */
-uint16_t motor_get_raw_angle(const motor_t *m);
-
-/**
- * Flush the encoder pipeline so the first angle motor_update() produces
- * is a fresh measurement rather than whatever the sensor had queued.
- *
- * @param m  the motor
- */
-void motor_prime(motor_t *m);
 
 /**
  * Turn the per-period encoder read on or off.
