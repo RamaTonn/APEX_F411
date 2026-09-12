@@ -146,6 +146,71 @@ static int32_t largest_phase_current_ma(int32_t current_a_ma,
     return largest;
 }
 
+/* Where a run gave up, if it did: the duty being applied and the
+ * largest phase current seen there. Recorded by the helpers below and
+ * copied into the caller's result, so a failed run can say where it
+ * went wrong rather than only that it did. Module-level for the same
+ * reason `motor` is: one run happens at a time. */
+static uint16_t fault_duty;
+static int32_t  fault_current_ma;
+
+/* Tracks how long the current has been CONTINUOUSLY above the limit.
+ *
+ * WHY A SINGLE READING IS NOT ENOUGH TO ACT ON
+ *
+ *   openloop.c makes this argument at OPENLOOP_ABORT_CONSECUTIVE_SAMPLES
+ *   and it applies here unchanged: the current measurement carries a few
+ *   counts of noise, and a one-off switching transient is not what
+ *   damages anything -- sustained current is. An earlier version of this
+ *   file aborted on the first reading over the limit and gave up on
+ *   perfectly good runs because of a single spike.
+ *
+ *   Time rather than a sample count, because these loops spin far faster
+ *   than the control interrupt republishes a current, so the same
+ *   reading gets seen many times over and counting iterations would
+ *   measure CPU speed rather than how long the current was really high. */
+typedef struct {
+    uint8_t  over;
+    uint32_t since_tick;
+} overcurrent_watch_t;
+
+static void overcurrent_watch_reset(overcurrent_watch_t *watch)
+{
+    watch->over       = 0u;
+    watch->since_tick = 0u;
+}
+
+/* @param watch       the watch being updated
+ * @param largest_ma  largest phase current magnitude just measured
+ * @return 1 once the current has been above the limit continuously for
+ *         ESTIMATE_OVERCURRENT_SUSTAIN_MS, 0 otherwise */
+static uint8_t overcurrent_watch_update(overcurrent_watch_t *watch,
+                                        int32_t largest_ma)
+{
+    if (largest_ma <= ESTIMATE_CURRENT_LIMIT_MA) {
+        watch->over = 0u;
+        return 0u;
+    }
+
+    if (watch->over == 0u) {
+        watch->over       = 1u;
+        watch->since_tick = HAL_GetTick();
+        return 0u;
+    }
+
+    return ((HAL_GetTick() - watch->since_tick)
+                >= ESTIMATE_OVERCURRENT_SUSTAIN_MS) ? 1u : 0u;
+}
+
+/* Bring every phase back to the resting point, for when a measurement
+ * stops early and the duty it was applying should not stay applied. */
+static void rest_bridge(void)
+{
+    for (uint8_t phase = 0u; phase < GATE_DRIVER_PHASE_COUNT; phase++) {
+        gate_driver_set_duty(phase, 500u);
+    }
+}
+
 /* The current actually flowing along the axis being driven, in
  * milliamps.
  *
@@ -187,34 +252,51 @@ static int32_t driven_axis_current_ma(uint16_t angle,
     return (int32_t)(iq_a * 1000.0f);
 }
 
-/* Average the driven-axis current over a period of time, and report the
- * largest raw phase current seen during that window for the overcurrent
- * check.
+/* Average the driven-axis current over a period of time, giving up early
+ * if the current stays over the limit for long enough to matter.
  *
  * The control loop samples at a fixed point in every switching period,
  * so its values are already free of switching ripple. Averaging removes
  * what remains.
  *
- * @param angle             electrical angle the vector is held at
- * @param amplitude         parts per thousand of bus voltage
- * @param milliseconds      how long to average over
- * @param peak_phase_ma_out largest raw phase current magnitude seen,
- *                          in milliamps. May be NULL.
+ * @param angle         electrical angle the vector is held at
+ * @param amplitude     parts per thousand of bus voltage
+ * @param milliseconds  how long to average over
+ * @param tripped_out   set to 1 if the run gave up on sustained
+ *                      overcurrent, 0 otherwise. May be NULL.
  * @return average driven-axis current in milliamps */
 static int32_t average_current_ma(uint16_t angle,
                                   uint16_t amplitude,
                                   uint32_t milliseconds,
-                                  int32_t *peak_phase_ma_out)
+                                  uint8_t *tripped_out)
 {
-    int64_t  total      = 0;
-    uint32_t count      = 0u;
-    uint32_t start       = HAL_GetTick();
-    int32_t  peak_phase = 0;
+    int64_t  total = 0;
+    uint32_t count = 0u;
+    uint32_t start = HAL_GetTick();
     int32_t  current_a;
     int32_t  current_b;
 
+    overcurrent_watch_t watch;
+    overcurrent_watch_reset(&watch);
+
+    if (tripped_out != NULL) {
+        *tripped_out = 0u;
+    }
+
     while ((HAL_GetTick() - start) < milliseconds) {
         sensors_get_currents(&current_a, &current_b);
+
+        int32_t largest = largest_phase_current_ma(current_a, current_b);
+
+        if (overcurrent_watch_update(&watch, largest) != 0u) {
+            rest_bridge();
+            fault_duty       = amplitude;
+            fault_current_ma = largest;
+            if (tripped_out != NULL) {
+                *tripped_out = 1u;
+            }
+            break;
+        }
 
         /* The vector is re-applied while averaging, for the same reason
          * hold_vector_for exists: the dead time correction is computed
@@ -223,17 +305,8 @@ static int32_t average_current_ma(uint16_t angle,
          * the correction at whatever it happened to be. */
         apply_vector(angle, amplitude, current_a, current_b);
 
-        int32_t phase_peak = largest_phase_current_ma(current_a, current_b);
-        if (phase_peak > peak_phase) {
-            peak_phase = phase_peak;
-        }
-
         total += driven_axis_current_ma(angle, current_a, current_b);
         count++;
-    }
-
-    if (peak_phase_ma_out != NULL) {
-        *peak_phase_ma_out = peak_phase;
     }
 
     return (count > 0u) ? (int32_t)(total / (int32_t)count) : 0;
@@ -253,29 +326,27 @@ static int32_t average_current_ma(uint16_t angle,
  * current does begin to flow produces a correction, which admits more
  * voltage, which produces more current, until it settles.
  *
- * CHECKS THE CURRENT LIMIT ON EVERY READ, NOT JUST AT THE END
+ * WATCHES THE CURRENT LIMIT THROUGHOUT, NOT JUST AT THE END
  *
  *   An earlier version of this function applied the vector for the
  *   whole hold with no limit check at all, relying on whatever called
  *   it to measure current afterward. That leaves the full hold duration
  *   -- for the resistance hunt, up to RESISTANCE_SETTLE_MS -- during
  *   which a duty that turns out to draw well over the limit is applied
- *   unchecked. On a low resistance winding, a single duty step small
- *   enough to be safe on a typical winding can still produce more
- *   current than the gap between a target and the limit allows, so
- *   catching it only afterward is catching it too late.
+ *   unchecked.
  *
  *   This loop already re-reads current every iteration anyway, for the
- *   dead time correction above -- checking it against the limit here
- *   costs nothing extra and catches an excursion within one read of it
- *   happening, however low the winding's resistance turns out to be.
+ *   dead time correction above, so watching it costs nothing extra. It
+ *   takes a SUSTAINED excursion to stop the run, not a single reading --
+ *   see overcurrent_watch_t for why acting on one reading threw away
+ *   good runs on nothing more than a switching transient.
  *
  * @param angle         electrical angle to hold
  * @param amplitude     parts per thousand of bus voltage
  * @param milliseconds  how long to hold it
- * @return 1 on success, 0 if the current exceeded the limit at any
- *         point during the hold -- the bridge is already back at rest
- *         duty when this returns 0 */
+ * @return 1 on success, 0 if the current stayed over the limit long
+ *         enough to give up -- the bridge is already back at rest duty
+ *         when this returns 0 */
 static uint8_t hold_vector_for(uint16_t angle,
                                uint16_t amplitude,
                                uint32_t milliseconds)
@@ -284,18 +355,20 @@ static uint8_t hold_vector_for(uint16_t angle,
     int32_t  current_a;
     int32_t  current_b;
 
+    overcurrent_watch_t watch;
+    overcurrent_watch_reset(&watch);
+
     while ((HAL_GetTick() - start) < milliseconds) {
         sensors_get_currents(&current_a, &current_b);
 
-        if (largest_phase_current_ma(current_a, current_b)
-                > ESTIMATE_CURRENT_LIMIT_MA) {
-            /* Back off immediately rather than continuing to apply a
-             * duty that already turned out to be too much for the rest
-             * of the hold. */
-            for (uint8_t phase = 0u; phase < GATE_DRIVER_PHASE_COUNT;
-                 phase++) {
-                gate_driver_set_duty(phase, 500u);
-            }
+        int32_t largest = largest_phase_current_ma(current_a, current_b);
+
+        if (overcurrent_watch_update(&watch, largest) != 0u) {
+            /* Back off rather than continuing to apply a duty that has
+             * now proved to be too much for the rest of the hold. */
+            rest_bridge();
+            fault_duty       = amplitude;
+            fault_current_ma = largest;
             return 0u;
         }
 
@@ -353,11 +426,11 @@ static uint8_t hunt_for_current(int32_t   target_ma,
             return ESTIMATE_ERR_OVERCURRENT;
         }
 
-        int32_t peak_phase_ma;
+        uint8_t tripped;
         int32_t measured = average_current_ma(0u, duty, RESISTANCE_AVERAGE_MS,
-                                              &peak_phase_ma);
+                                              &tripped);
 
-        if (peak_phase_ma > ESTIMATE_CURRENT_LIMIT_MA) {
+        if (tripped != 0u) {
             return ESTIMATE_ERR_OVERCURRENT;
         }
 
@@ -366,6 +439,12 @@ static uint8_t hunt_for_current(int32_t   target_ma,
             *current_out = measured;
             return ESTIMATE_OK;
         }
+
+        /* Recorded every step, so that if the ceiling is reached the
+         * report says how far the current actually got rather than
+         * leaving it to be guessed at. */
+        fault_duty       = duty;
+        fault_current_ma = measured;
     }
 
     /* The ceiling was reached without the current arriving. Either the
@@ -392,12 +471,25 @@ uint8_t estimate_resistance(motor_t *m,
         return ESTIMATE_ERR_NOT_READY;
     }
 
+    fault_duty       = 0u;
+    fault_current_ma = 0;
+
+    result_out->resistance_mohm = 0u;
+    result_out->low_duty        = 0u;
+    result_out->high_duty       = 0u;
+    result_out->low_current_ma  = 0;
+    result_out->high_current_ma = 0;
+    result_out->fault_duty      = 0u;
+    result_out->fault_current_ma = 0;
+
     enable_bridge();
 
     uint8_t outcome = hunt_for_current(RESISTANCE_LOW_TARGET_MA,
                                        &duty, &low_current);
     if (outcome != ESTIMATE_OK) {
         gate_driver_disable_all();
+        result_out->fault_duty       = fault_duty;
+        result_out->fault_current_ma = fault_current_ma;
         return outcome;
     }
     low_duty = duty;
@@ -414,6 +506,14 @@ uint8_t estimate_resistance(motor_t *m,
 
     gate_driver_disable_all();
 
+    /* Reported either way: the low point is real even when the high one
+     * never arrived, and knowing where the first one landed is most of
+     * the story when working out why the second did not. */
+    result_out->low_duty         = low_duty;
+    result_out->low_current_ma   = low_current;
+    result_out->fault_duty       = fault_duty;
+    result_out->fault_current_ma = fault_current_ma;
+
     if (outcome != ESTIMATE_OK) {
         return outcome;
     }
@@ -421,7 +521,8 @@ uint8_t estimate_resistance(motor_t *m,
     int32_t current_change = high_current - low_current;
 
     if (absolute(current_change) < ESTIMATE_MINIMUM_CURRENT_CHANGE_MA) {
-        result_out->resistance_mohm = 0u;
+        result_out->high_duty       = duty;
+        result_out->high_current_ma = high_current;
         return ESTIMATE_ERR_TOO_SMALL;
     }
 

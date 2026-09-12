@@ -74,6 +74,21 @@
 /* Current at which a pulse is abandoned, in milliamps. */
 #define ESTIMATE_CURRENT_LIMIT_MA 6000
 
+/* How long the current must stay continuously above that limit before a
+ * measurement gives up, in milliseconds.
+ *
+ * A single reading over the limit is a poor basis for abandoning a run,
+ * for the same reasons openloop.c spells out at
+ * OPENLOOP_ABORT_CONSECUTIVE_SAMPLES: the measurement carries a few
+ * counts of noise, and a one-off switching transient is not what damages
+ * anything -- sustained current is. Two milliseconds is far too short
+ * for a winding or a transistor to heat appreciably, so nothing is given
+ * up by waiting that long to be sure, and every spurious trip goes away.
+ *
+ * The tick has one millisecond of resolution, so the real threshold lies
+ * somewhere between one and two milliseconds. Both are safe. */
+#define ESTIMATE_OVERCURRENT_SUSTAIN_MS 2U
+
 /* How long the rotor is held before a measurement, in milliseconds. */
 #define ESTIMATE_HOLD_MS 500U
 
@@ -115,6 +130,17 @@ typedef struct {
     uint16_t high_duty;
     int32_t  low_current_ma;
     int32_t  high_current_ma;
+
+    /* Where a run gave up, when one did: the duty being applied and the
+     * largest phase current seen there, in milliamps. Both zero on a
+     * successful run.
+     *
+     * Reported on the error reply as well as the success one, because
+     * "overcurrent" or "current_change_too_small" on its own says
+     * nothing about whether the drive never got going or ran away, and
+     * those want opposite fixes. */
+    uint16_t fault_duty;
+    int32_t  fault_current_ma;
 } estimate_resistance_result_t;
 
 /**

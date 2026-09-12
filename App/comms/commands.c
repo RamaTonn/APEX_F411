@@ -701,7 +701,16 @@ static void command_eres(const protocol_args_t *args)
     uint8_t outcome = estimate_resistance(motor, &result);
 
     if (outcome != ESTIMATE_OK) {
-        protocol_reply_error("eres", estimate_result_text(outcome));
+        /* The reason alone does not say whether the drive never got
+         * going or ran away, and those want opposite fixes -- so report
+         * where it stopped and how far the current had got by then. */
+        protocol_reply_begin(PROTOCOL_STATUS_ERROR, "eres");
+        protocol_reply_text("reason",    estimate_result_text(outcome));
+        protocol_reply_uint("at_duty",   result.fault_duty);
+        protocol_reply_int("at_ma",      result.fault_current_ma);
+        protocol_reply_uint("lo_duty",   result.low_duty);
+        protocol_reply_int("lo_ma",      result.low_current_ma);
+        protocol_reply_end();
         return;
     }
 
