@@ -253,12 +253,32 @@ static int32_t average_current_ma(uint16_t angle,
  * current does begin to flow produces a correction, which admits more
  * voltage, which produces more current, until it settles.
  *
+ * CHECKS THE CURRENT LIMIT ON EVERY READ, NOT JUST AT THE END
+ *
+ *   An earlier version of this function applied the vector for the
+ *   whole hold with no limit check at all, relying on whatever called
+ *   it to measure current afterward. That leaves the full hold duration
+ *   -- for the resistance hunt, up to RESISTANCE_SETTLE_MS -- during
+ *   which a duty that turns out to draw well over the limit is applied
+ *   unchecked. On a low resistance winding, a single duty step small
+ *   enough to be safe on a typical winding can still produce more
+ *   current than the gap between a target and the limit allows, so
+ *   catching it only afterward is catching it too late.
+ *
+ *   This loop already re-reads current every iteration anyway, for the
+ *   dead time correction above -- checking it against the limit here
+ *   costs nothing extra and catches an excursion within one read of it
+ *   happening, however low the winding's resistance turns out to be.
+ *
  * @param angle         electrical angle to hold
  * @param amplitude     parts per thousand of bus voltage
- * @param milliseconds  how long to hold it */
-static void hold_vector_for(uint16_t angle,
-                            uint16_t amplitude,
-                            uint32_t milliseconds)
+ * @param milliseconds  how long to hold it
+ * @return 1 on success, 0 if the current exceeded the limit at any
+ *         point during the hold -- the bridge is already back at rest
+ *         duty when this returns 0 */
+static uint8_t hold_vector_for(uint16_t angle,
+                               uint16_t amplitude,
+                               uint32_t milliseconds)
 {
     uint32_t start = HAL_GetTick();
     int32_t  current_a;
@@ -266,8 +286,22 @@ static void hold_vector_for(uint16_t angle,
 
     while ((HAL_GetTick() - start) < milliseconds) {
         sensors_get_currents(&current_a, &current_b);
+
+        if (largest_phase_current_ma(current_a, current_b)
+                > ESTIMATE_CURRENT_LIMIT_MA) {
+            /* Back off immediately rather than continuing to apply a
+             * duty that already turned out to be too much for the rest
+             * of the hold. */
+            for (uint8_t phase = 0u; phase < GATE_DRIVER_PHASE_COUNT;
+                 phase++) {
+                gate_driver_set_duty(phase, 500u);
+            }
+            return 0u;
+        }
+
         apply_vector(angle, amplitude, current_a, current_b);
     }
+    return 1u;
 }
 
 /* Enable every phase with nothing applied. */
@@ -311,8 +345,13 @@ static uint8_t hunt_for_current(int32_t   target_ma,
 
         /* Held rather than applied once, so the dead time correction can
          * settle: it is computed from the measured current, which is
-         * zero at the instant a new duty is first written. */
-        hold_vector_for(0u, duty, RESISTANCE_SETTLE_MS);
+         * zero at the instant a new duty is first written. Checks the
+         * limit throughout the hold, not just afterward -- see
+         * hold_vector_for() for why that matters on a low resistance
+         * winding. */
+        if (hold_vector_for(0u, duty, RESISTANCE_SETTLE_MS) == 0u) {
+            return ESTIMATE_ERR_OVERCURRENT;
+        }
 
         int32_t peak_phase_ma;
         int32_t measured = average_current_ma(0u, duty, RESISTANCE_AVERAGE_MS,
@@ -512,7 +551,9 @@ static uint8_t measure_axis(uint16_t  angle,
         /* Re-establish the holding current and let the rotor settle back
          * before each attempt, so every pulse starts from the same
          * place. */
-        hold_vector_for(0u, hold_duty, 50u);
+        if (hold_vector_for(0u, hold_duty, 50u) == 0u) {
+            return ESTIMATE_ERR_OVERCURRENT;
+        }
 
         int32_t change;
 
@@ -595,7 +636,10 @@ uint8_t estimate_inductance(motor_t *m,
 
     /* Pull the rotor into line with electrical angle zero and let it
      * settle. Every pulse below is measured relative to this position. */
-    hold_vector_for(0u, hold_duty, ESTIMATE_HOLD_MS);
+    if (hold_vector_for(0u, hold_duty, ESTIMATE_HOLD_MS) == 0u) {
+        gate_driver_disable_all();
+        return ESTIMATE_ERR_OVERCURRENT;
+    }
 
     /* Along the magnet axis. The pulse points the same way the rotor is
      * already aligned, so it produces no torque and the rotor does not
