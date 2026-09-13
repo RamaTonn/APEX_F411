@@ -302,15 +302,32 @@ static const resistance_pair_t resistance_pairs[3] = {
  * polarity, so the dead time removed the same slice of voltage from
  * each and it cancels in the difference.
  *
- * The bus is read at BOTH points rather than once. It sags as the
- * measurement draws more current, and the slope is a difference of two
- * voltages -- so using one reading for both charges the sag to the
- * winding and reads high, by more at the higher current.
+ * THE BUS IS READ WITH NO CURRENT FLOWING, and that is deliberate.
+ *
+ * The reported bus falls as the winding current rises -- by nearly two
+ * volts between this measurement's two operating points on the bench
+ * this was developed against. That looked like supply sag, and an
+ * earlier version subtracted it as such. It cannot be.
+ *
+ * The bridge chops phase A at about four percent to pass three amps, so
+ * the supply only delivers about a tenth of an amp on average, and the
+ * current it delivers changes by less than a tenth of an amp between the
+ * two points. Two volts across that is twenty ohms of source impedance,
+ * which no supply and no wiring has. Referred back through the divider
+ * it is eighty millivolts at the ADC pin, which at three amps is
+ * twenty-seven milliohms of shared sense-and-power ground -- entirely
+ * ordinary on a small board.
+ *
+ * So it is the READING that moves with current, not the rail. Treating
+ * it as real subtracted a measurement error from the applied voltage and
+ * pushed the answer low by nearly half. The quiet reading is the honest
+ * reference, and how far the loaded reading departs from it is reported
+ * instead of acted on.
  *
  * @param pair          which phases to drive, ground, float and read
  * @param mohm_out      the two windings in series, in milliohms
- * @param bus_mv_out    the bus at the lower point, millivolts
- * @param sag_mv_out    how far it had fallen by the upper point
+ * @param bus_mv_out    the bus with no current flowing, millivolts
+ * @param sag_mv_out    how far the reading had fallen by the upper point
  * @return an ESTIMATE_ result code */
 static uint8_t measure_pair(const resistance_pair_t *pair,
                             uint32_t *mohm_out,
@@ -321,11 +338,13 @@ static uint8_t measure_pair(const resistance_pair_t *pair,
     uint16_t high_duty    = 0u;
     int32_t  low_current  = 0;
     int32_t  high_current = 0;
-    uint32_t low_bus_mv   = 0u;
     uint32_t high_bus_mv  = 0u;
     uint8_t  reached      = 0u;
 
     enable_pair(pair->high_phase, pair->low_phase);
+
+    /* The reference, taken before any current flows. */
+    uint32_t quiet_bus_mv = sensors_get_bus_mv();
 
     for (uint16_t duty = RESISTANCE_DUTY_STEP;
          duty <= RESISTANCE_MAX_DUTY;
@@ -357,11 +376,8 @@ static uint8_t measure_pair(const resistance_pair_t *pair,
             low_duty    = duty;
             low_current = measured;
 
-            /* Averaged over the same window the current was, not
-             * sampled once: the supply sags under load, and the voltage
-             * that matters is the one actually available while the
-             * current being recorded was flowing. */
-            low_bus_mv = measured_bus_mv;
+            /* Nothing to record here: the voltage reference is the
+             * quiet reading taken before the ramp began. */
         }
 
         if ((low_duty != 0u) && (measured >= RESISTANCE_HIGH_TARGET_MA)) {
@@ -385,19 +401,18 @@ static uint8_t measure_pair(const resistance_pair_t *pair,
         return ESTIMATE_ERR_TOO_SMALL;
     }
 
-    /* Each point's own bus against its own duty, so a supply that sagged
-     * between them is subtracted rather than charged to the winding.
+    /* One bus, the quiet one, against the duty difference -- see the
+     * note above on why the loaded reading is not used.
      *
      * Millivolts over milliamps is ohms directly, so the thousand turns
      * it into milliohms. */
     int32_t voltage_change_mv =
-        (int32_t)(((int64_t)high_bus_mv * (int64_t)high_duty
-                   - (int64_t)low_bus_mv * (int64_t)low_duty)
-                  / (int64_t)GATE_DRIVER_DUTY_SCALE);
+        (int32_t)((quiet_bus_mv * (uint32_t)(high_duty - low_duty))
+                  / GATE_DRIVER_DUTY_SCALE);
 
     *mohm_out   = (uint32_t)((voltage_change_mv * 1000) / current_change);
-    *bus_mv_out = low_bus_mv;
-    *sag_mv_out = (int32_t)low_bus_mv - (int32_t)high_bus_mv;
+    *bus_mv_out = quiet_bus_mv;
+    *sag_mv_out = (int32_t)quiet_bus_mv - (int32_t)high_bus_mv;
 
     return ESTIMATE_OK;
 }
@@ -1174,8 +1189,19 @@ uint8_t estimate_inductance(motor_t *m,
     result_out->q_mohm           = 0u;
     result_out->half_periods     = 0u;
     result_out->hold_duty        = 0u;
+    result_out->line_to_line_d_nh = 0u;
+    result_out->line_to_line_q_nh = 0u;
+    result_out->bus_quiet_mv      = 0u;
+    result_out->bus_loaded_mv     = 0u;
 
     enable_bridge();
+
+    /* The bus with nothing flowing. This is the scale of the whole
+     * answer -- the inductance is proportional to it -- and the reading
+     * moves with winding current on this board, for the reasons
+     * measure_pair() sets out. The holding current is three amps, so a
+     * reading taken during the hold carries the full error. */
+    uint32_t bus_mv = sensors_get_bus_mv();
 
     /* Draw the rotor into line with phase A's axis and hold it there.
      * The field points where the rotor is asked to go, so once it
@@ -1198,10 +1224,12 @@ uint8_t estimate_inductance(motor_t *m,
         return ESTIMATE_ERR_OVERCURRENT;
     }
 
-    /* Read the bus with the holding current flowing rather than before
-     * it: the supply sags once the measurement starts drawing amps, and
-     * the voltage that matters is the one actually available. */
-    uint32_t bus_mv = sensors_get_bus_mv();
+    /* What the bus reads once the holding current is established. Not
+     * used for anything: reported so the departure from the quiet
+     * reading is visible, since that departure scales the answer
+     * directly if it is ever believed. */
+    result_out->bus_quiet_mv  = bus_mv;
+    result_out->bus_loaded_mv = sensors_get_bus_mv();
 
     /* First pass: a short run at a middling half length, whose only job
      * is to find out roughly how fast this winding is. The d axis is
@@ -1294,6 +1322,19 @@ uint8_t estimate_inductance(motor_t *m,
                               + (result_out->q_tau_us / 2u))
                              / result_out->q_tau_us;
     }
+
+    /* The same two inductances as a meter across two motor leads would
+     * see them. Current entering one terminal and leaving another passes
+     * through two windings in series, and the flux that links is twice
+     * what one axis carries, so the line-to-line figure is exactly
+     * double the per-phase one.
+     *
+     * Reported because that is the form anyone checking this against an
+     * LCR meter will have in front of them, and the factor of two
+     * between the two conventions is otherwise an easy way to conclude
+     * the measurement is out by half when it is not. */
+    result_out->line_to_line_d_nh = result_out->inductance_d_nh * 2u;
+    result_out->line_to_line_q_nh = result_out->inductance_q_nh * 2u;
 
     /* Stored in henries, converted from the nanohenries the protocol
      * reports. */

@@ -201,6 +201,17 @@ typedef struct {
     uint32_t inductance_d_nh;
     uint32_t inductance_q_nh;
 
+    /* The same two, as a meter across two motor leads would see them:
+     * exactly double the per-phase figures, because current entering one
+     * terminal and leaving another passes through two windings in series
+     * and links twice the flux.
+     *
+     * Reported because an LCR meter gives the line-to-line form, and
+     * comparing it against the per-phase one makes a correct measurement
+     * look like it is out by half. */
+    uint32_t line_to_line_d_nh;
+    uint32_t line_to_line_q_nh;
+
     /* The ratio between them, as a percentage. Under about 110 means
      * high-frequency injection will not work reliably on this motor,
      * since there is too little difference between the axes to detect.
@@ -265,6 +276,17 @@ typedef struct {
      * Chosen from the winding's own time constant rather than fixed --
      * see estimate.c on why a fixed one cannot suit every motor. */
     uint16_t half_periods;
+
+    /* The bus with nothing flowing, and what it read once the holding
+     * current was established.
+     *
+     * The first is what the answer is scaled by. The second is reported
+     * beside it because on this board the READING moves with winding
+     * current even though the rail does not -- see measure_pair() -- and
+     * the gap between these two is how much that would have cost if it
+     * were believed. */
+    uint32_t bus_quiet_mv;
+    uint32_t bus_loaded_mv;
 
     /* The d-axis holding size the ramp settled on, in perturbation
      * units. Reported because everything else sits on it: it is what

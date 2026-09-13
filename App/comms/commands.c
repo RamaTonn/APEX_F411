@@ -784,6 +784,13 @@ static void command_eind(const protocol_args_t *args)
     protocol_reply_begin(PROTOCOL_STATUS_OK, "eind");
     protocol_reply_uint("ld_nh",  result.inductance_d_nh);
     protocol_reply_uint("lq_nh",  result.inductance_q_nh);
+    /* The same two as a meter across two motor leads reads them, which
+     * is exactly double: current entering one terminal and leaving
+     * another goes through two windings in series. Reported so an LCR
+     * reading can be compared without the factor of two between the two
+     * conventions making a correct answer look half-sized. */
+    protocol_reply_uint("ld_ll",  result.line_to_line_d_nh);
+    protocol_reply_uint("lq_ll",  result.line_to_line_q_nh);
     /* Saliency as a percentage: how much larger the q-axis inductance
      * is than the d-axis one. Under about 110 means injection will not
      * work reliably on this motor. */
@@ -811,6 +818,156 @@ static void command_eind(const protocol_args_t *args)
     protocol_reply_uint("q_tau",  result.q_tau_us);
     protocol_reply_uint("d_mohm", result.d_mohm);
     protocol_reply_uint("q_mohm", result.q_mohm);
+    /* The bus with nothing flowing, which is what the answer is scaled
+     * by, and what it read under the holding current. A gap between them
+     * is a reading that moves with winding current -- check it with
+     * ical and a meter, because it scales the inductance directly. */
+    protocol_reply_uint("quiet_mv", result.bus_quiet_mv);
+    protocol_reply_uint("load_mv",  result.bus_loaded_mv);
+    protocol_reply_end();
+}
+
+/* Highest duty ical will accept, how long it will hold for, and the
+ * current at which it gives up.
+ *
+ * The duty ceiling is a ceiling and not a clamp: this drives two
+ * windings in series straight across the bus, and on a winding of a few
+ * tens of milliohms a slip of the finger is the one way to damage
+ * something with this command. Forty parts per thousand is already
+ * several amps there. */
+#define ICAL_MAXIMUM_DUTY 120U
+#define ICAL_MAXIMUM_MS   10000U
+#define ICAL_ABORT_MA     8000
+
+/* ical
+ *
+ * Holds a steady, known current through two phases so the board's own
+ * scaling can be checked against meters.
+ *
+ * Every absolute number this firmware produces rests on two calibration
+ * constants: 40.28 milliamps per ADC count for the phase current, and a
+ * divider ratio of 23 for the bus. Neither is verifiable from inside --
+ * a wrong gain makes the resistance and the inductance wrong by exactly
+ * the same factor, and nothing internal contradicts it. So this command
+ * exists only to make them measurable from outside.
+ *
+ * Phase A is chopped at the requested duty, phase B is held at ground,
+ * and phase C floats -- the same path the resistance measurement uses.
+ * The hold lasts long enough to read an instrument, and the currents and
+ * bus are averaged over the whole of it.
+ *
+ *   With a DC ammeter in series with the phase A lead, ia_ma should
+ *   agree with it. If it does not, COUNTS_TO_MILLIAMPS in sensors.c is
+ *   wrong -- most likely the INA240 variant fitted, whose gain is 20,
+ *   50, 100 or 200 depending on the suffix.
+ *
+ *   With a voltmeter across the bus, vbus_mv should agree, AND SHOULD
+ *   NOT MOVE as the duty is raised. On the bench this was developed
+ *   against the reading falls nearly two volts as the current climbs,
+ *   which cannot be the rail -- at four percent duty the supply is only
+ *   delivering a tenth of an amp. Run this at a few duties and watch
+ *   whether the meter follows the reading or stays put.
+ *
+ * Usage: ical <duty> [milliseconds] */
+static void command_ical(const protocol_args_t *args)
+{
+    uint32_t duty = (uint32_t)protocol_arg_int(args, 1u, 0);
+    uint32_t hold_ms = (protocol_arg_count(args) > 2u)
+                           ? (uint32_t)protocol_arg_int(args, 2u, 3000)
+                           : 3000u;
+
+    /* A ceiling rather than a clamp: this drives a dead short across two
+     * windings, and a slip of the finger on the duty is the one way to
+     * damage something with it. */
+    if ((duty == 0u) || (duty > ICAL_MAXIMUM_DUTY)) {
+        protocol_reply_begin(PROTOCOL_STATUS_ERROR, "ical");
+        protocol_reply_text("reason", "duty_out_of_range");
+        protocol_reply_uint("max", ICAL_MAXIMUM_DUTY);
+        protocol_reply_end();
+        return;
+    }
+    if (hold_ms > ICAL_MAXIMUM_MS) {
+        hold_ms = ICAL_MAXIMUM_MS;
+    }
+    if (loop_is_running() == 0u) {
+        protocol_reply_begin(PROTOCOL_STATUS_ERROR, "ical");
+        protocol_reply_text("reason", "control_loop_not_running");
+        protocol_reply_end();
+        return;
+    }
+
+    /* The quiet bus, before anything is drawn. */
+    uint32_t quiet_bus_mv = sensors_get_bus_mv();
+
+    for (uint8_t phase = 0u; phase < GATE_DRIVER_PHASE_COUNT; phase++) {
+        gate_driver_set_duty(phase, 0u);
+    }
+    gate_driver_disable_all();
+    gate_driver_enable_phase(GATE_DRIVER_PHASE_B);
+    gate_driver_enable_phase(GATE_DRIVER_PHASE_A);
+
+    gate_driver_set_duty(GATE_DRIVER_PHASE_B, 0u);
+    gate_driver_set_duty(GATE_DRIVER_PHASE_A, (uint16_t)duty);
+
+    int64_t  total_a = 0;
+    int64_t  total_b = 0;
+    int64_t  total_bus = 0;
+    uint32_t samples = 0u;
+    int32_t  peak_ma = 0;
+    uint8_t  tripped = 0u;
+
+    uint32_t start = HAL_GetTick();
+
+    while ((HAL_GetTick() - start) < hold_ms) {
+        int32_t current_a;
+        int32_t current_b;
+
+        sensors_get_currents(&current_a, &current_b);
+
+        int32_t magnitude = (current_a < 0) ? -current_a : current_a;
+        if (magnitude > peak_ma) {
+            peak_ma = magnitude;
+        }
+        if (magnitude > ICAL_ABORT_MA) {
+            tripped = 1u;
+            break;
+        }
+
+        total_a   += current_a;
+        total_b   += current_b;
+        total_bus += (int64_t)sensors_get_bus_mv();
+        samples++;
+    }
+
+    for (uint8_t phase = 0u; phase < GATE_DRIVER_PHASE_COUNT; phase++) {
+        gate_driver_set_duty(phase, 0u);
+    }
+    HAL_Delay(1u);
+    gate_driver_disable_all();
+
+    if (samples == 0u) {
+        samples = 1u;
+    }
+
+    protocol_reply_begin(tripped ? PROTOCOL_STATUS_ERROR : PROTOCOL_STATUS_OK,
+                         "ical");
+    if (tripped != 0u) {
+        protocol_reply_text("reason", "overcurrent");
+    }
+    protocol_reply_uint("duty",    duty);
+    protocol_reply_uint("ms",      hold_ms);
+    /* Phase A carries the whole current; B returns all of it, so ib
+     * should read the negative of ia. A pair that does not mirror says
+     * the two sensors disagree with each other, before either is
+     * compared with anything outside. */
+    protocol_reply_int("ia_ma",    (int32_t)(total_a / (int64_t)samples));
+    protocol_reply_int("ib_ma",    (int32_t)(total_b / (int64_t)samples));
+    protocol_reply_int("peak_ma",  peak_ma);
+    /* The bus before the current flowed, and while it was flowing. A gap
+     * between these two is what a meter on the bus settles. */
+    protocol_reply_uint("quiet_mv", quiet_bus_mv);
+    protocol_reply_uint("load_mv",
+        (uint32_t)(total_bus / (int64_t)samples));
     protocol_reply_end();
 }
 
@@ -983,6 +1140,7 @@ static const struct {
     { "calib",    0x80u, command_calib    },
     { "comm",     0x81u, command_comm     },
     { "eres",     0x85u, command_eres     },
+    { "ical",     0x88u, command_ical     },
     { "eind",     0x86u, command_eind     },
     { "param",    0x87u, command_param    },
     /* telemetry */
