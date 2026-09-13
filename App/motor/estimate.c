@@ -49,98 +49,6 @@ static motor_t *motor;
 #define RESISTANCE_AVERAGE_MS 20U
 
 /* ------------------------------------------------------------------
- * Inductance measurement settings
- * ------------------------------------------------------------------ */
-
-/* The holding current the rotor is aligned with and the pulse steps
- * from, in milliamps, and how long to let the rotor settle at it.
- *
- * A CURRENT rather than a duty, and that is the important part. The
- * pulse measures a DIFFERENCE between two duties, and that difference
- * is free of the dead-time loss only if current was already flowing at
- * the lower of them -- the loss is then identical at both points and
- * cancels. A baseline below the dead time passes no current at all, so
- * the step crosses from not conducting to conducting and the entire
- * dead-time loss lands in the answer instead.
- *
- * An earlier version held a fixed duty of 8, which is a third of the
- * dead time on this board: the winding saw nothing, the baseline was
- * zero, and the pulse was measured against a starting point that was
- * not where it was assumed to be.
- *
- * Targeting a current fixes that for any board rather than for this
- * one. A fixed duty large enough to conduct on a 12 volt bus draws
- * twice as much on a 24 volt one and four times on a 48 volt one, and
- * a duty small enough to be safe there is back below the dead time
- * here. An amp and a half is enough to hold a rotor this board drives
- * against friction and cogging, and is a small fraction of what the
- * winding carries in use. */
-#define ALIGN_TARGET_MA 1500
-#define ALIGN_MS        400U
-
-/* Highest duty the alignment ramp will reach before giving up, and how
- * long each of its steps settles and averages for, in milliseconds.
- *
- * The ramp doubles as the alignment: the rotor is dragged into line
- * gradually as the current comes up, rather than being slammed there by
- * a duty applied all at once. A few milliseconds a step is many
- * electrical time constants and a hundred and fifty steps is under a
- * second and a half in the worst case. */
-#define ALIGN_MAX_DUTY    150U
-#define ALIGN_SETTLE_MS   4U
-#define ALIGN_AVERAGE_MS  4U
-
-/* Duties added on top for the measuring pulse, smallest first.
- *
- * Started small and raised only if the current change was too small to
- * measure, so a low inductance winding is never hit harder than it
- * needs to be -- and, just as importantly, so a high voltage bus is not
- * hit as hard as a low voltage one. The change a given step produces
- * scales with the bus, so the step that satisfies
- * ESTIMATE_MINIMUM_CURRENT_CHANGE_MA on a 48 volt supply is a quarter
- * of the one needed on a 12 volt supply, and the current that flows is
- * about the same on both. That is why the list starts at 1 rather than
- * at something comfortable for this board: the first entry that works
- * is the one used. */
-static const uint16_t pulse_steps[] = { 1u, 2u, 4u, 8u, 16u, 32u, 64u, 128u };
-#define PULSE_STEP_COUNT (sizeof pulse_steps / sizeof pulse_steps[0])
-
-/* How long the across-axis pre-hold lasts before its pulse, in
- * milliseconds.
- *
- * The across-axis field is ninety degrees from where the rotor is
- * sitting, so it produces maximum torque -- unlike the along-axis case,
- * this cannot be held for long. Two milliseconds is several L/R time
- * constants, so the current has settled and the pulse has a steady
- * baseline to step from, while being far less than the rotor needs to
- * accelerate anywhere meaningful. */
-#define ACROSS_PREHOLD_MS 2U
-
-/* How many phases' worth of winding each topology puts in the current's
- * path, doubled so the arithmetic stays in halves.
- *
- * Phase A driven against B and C in parallel is 1.5, and the flux that
- * geometry links at the terminals is 1.5 Ld. Phase B driven against C
- * with A floating is 2, and links 2 Lq. Both factors come out of the
- * winding geometry rather than being fitted, and both are used twice --
- * once to turn a terminal resistance into a series resistance for the
- * inversion, once to turn the series inductance back into a per-axis
- * one. */
-#define ALONG_AXIS_PHASES_DOUBLED  3U
-#define ACROSS_AXIS_PHASES_DOUBLED 4U
-
-/* How far into its exponential a pulse may be before the inversion is
- * abandoned, as a fraction of the final current.
- *
- * L = -t R / ln(1 - dI R / V) loses its grip as that fraction
- * approaches one: the logarithm's argument goes to zero, so a couple of
- * counts of sensor noise move the answer by an unbounded amount. Past
- * this point the pulse has simply outlasted the winding and the only
- * real fix is a shorter one, which is what ESTIMATE_ERR_PULSE_TOO_LONG
- * says. */
-#define PULSE_SETTLED_FRACTION_LIMIT 0.98f
-
-/* ------------------------------------------------------------------
  * Small helpers
  * ------------------------------------------------------------------ */
 
@@ -236,24 +144,6 @@ static void enable_pair(uint8_t high_phase, uint8_t low_phase)
 
     gate_driver_enable_phase(low_phase);
     gate_driver_enable_phase(high_phase);
-}
-
-/* Phase A at `duty`, B and C grounded. Field along phase A's own axis;
- * the winding sees 1.5 R and 1.5 L. */
-static void drive_along_axis(uint16_t duty)
-{
-    gate_driver_set_duty(GATE_DRIVER_PHASE_B, 0u);
-    gate_driver_set_duty(GATE_DRIVER_PHASE_C, 0u);
-    gate_driver_set_duty(GATE_DRIVER_PHASE_A, duty);
-}
-
-/* Phase B at `duty`, C grounded, A left however the caller set it.
- * With A floating this is two phases in series: 2 R and 2 L, with the
- * field ninety electrical degrees from phase A's axis. */
-static void drive_across_axis(uint16_t duty)
-{
-    gate_driver_set_duty(GATE_DRIVER_PHASE_C, 0u);
-    gate_driver_set_duty(GATE_DRIVER_PHASE_B, duty);
 }
 
 /* Wait, watching the current, and give up if it stays over the limit.
@@ -396,19 +286,27 @@ static const resistance_pair_t resistance_pairs[3] = {
  * polarity, so the dead time removed the same slice of voltage from
  * each and it cancels in the difference.
  *
+ * The bus is read at BOTH points rather than once. It sags as the
+ * measurement draws more current, and the slope is a difference of two
+ * voltages -- so using one reading for both charges the sag to the
+ * winding and reads high, by more at the higher current.
+ *
  * @param pair          which phases to drive, ground, float and read
  * @param mohm_out      the two windings in series, in milliohms
- * @param bus_mv_out    the bus while current was flowing, millivolts
+ * @param bus_mv_out    the bus at the lower point, millivolts
+ * @param sag_mv_out    how far it had fallen by the upper point
  * @return an ESTIMATE_ result code */
 static uint8_t measure_pair(const resistance_pair_t *pair,
                             uint32_t *mohm_out,
-                            uint32_t *bus_mv_out)
+                            uint32_t *bus_mv_out,
+                            int32_t  *sag_mv_out)
 {
     uint16_t low_duty     = 0u;
     uint16_t high_duty    = 0u;
     int32_t  low_current  = 0;
     int32_t  high_current = 0;
-    uint32_t bus_mv       = 0u;
+    uint32_t low_bus_mv   = 0u;
+    uint32_t high_bus_mv  = 0u;
     uint8_t  reached      = 0u;
 
     enable_pair(pair->high_phase, pair->low_phase);
@@ -444,12 +342,13 @@ static uint8_t measure_pair(const resistance_pair_t *pair,
             /* Read under load rather than before it: the supply sags
              * once the measurement starts drawing amps, and the voltage
              * that matters is the one actually available. */
-            bus_mv = sensors_get_bus_mv();
+            low_bus_mv = sensors_get_bus_mv();
         }
 
         if ((low_duty != 0u) && (measured >= RESISTANCE_HIGH_TARGET_MA)) {
             high_duty    = duty;
             high_current = measured;
+            high_bus_mv  = sensors_get_bus_mv();
             reached      = 1u;
             break;
         }
@@ -467,14 +366,19 @@ static uint8_t measure_pair(const resistance_pair_t *pair,
         return ESTIMATE_ERR_TOO_SMALL;
     }
 
-    /* Millivolts over milliamps is ohms directly, so the thousand turns
+    /* Each point's own bus against its own duty, so a supply that sagged
+     * between them is subtracted rather than charged to the winding.
+     *
+     * Millivolts over milliamps is ohms directly, so the thousand turns
      * it into milliohms. */
     int32_t voltage_change_mv =
-        (int32_t)((bus_mv * (uint32_t)(high_duty - low_duty))
-                  / GATE_DRIVER_DUTY_SCALE);
+        (int32_t)(((int64_t)high_bus_mv * (int64_t)high_duty
+                   - (int64_t)low_bus_mv * (int64_t)low_duty)
+                  / (int64_t)GATE_DRIVER_DUTY_SCALE);
 
     *mohm_out   = (uint32_t)((voltage_change_mv * 1000) / current_change);
-    *bus_mv_out = bus_mv;
+    *bus_mv_out = low_bus_mv;
+    *sag_mv_out = (int32_t)low_bus_mv - (int32_t)high_bus_mv;
 
     return ESTIMATE_OK;
 }
@@ -500,6 +404,7 @@ static uint32_t solve_phase(uint32_t with_previous,
 }
 
 uint8_t estimate_resistance(motor_t *m,
+                            uint8_t reverse_order,
                             estimate_resistance_result_t *result_out)
 {
     motor = m;
@@ -524,25 +429,43 @@ uint8_t estimate_resistance(motor_t *m,
     result_out->phase_mohm        = 0u;
     result_out->imbalance_percent = 0u;
     result_out->bus_mv            = 0u;
+    result_out->sag_mv            = 0;
     result_out->fault_pair        = ESTIMATE_PAIR_NONE;
     result_out->fault_duty        = 0u;
     result_out->fault_current_ma  = 0;
 
     uint32_t line_mohm[3] = { 0u, 0u, 0u };
     uint32_t bus_total    = 0u;
+    int32_t  worst_sag    = 0;
     uint8_t  outcome      = ESTIMATE_OK;
 
-    for (uint8_t i = 0u; i < 3u; i++) {
+    for (uint8_t position = 0u; position < 3u; position++) {
+
+        /* Which pair this position measures. Reversing it is a test, not
+         * a tuning knob: a winding's resistance does not depend on the
+         * order it was measured in, so if the three answers follow the
+         * ORDER rather than the pairs, what is being measured is drift
+         * -- the motor warming under the test, or a supply sagging as it
+         * runs -- and not the winding at all. */
+        uint8_t i = (reverse_order != 0u) ? (uint8_t)(2u - position)
+                                          : position;
+
         uint32_t bus_mv = 0u;
+        int32_t  sag_mv = 0;
 
         fault_pair = i;
 
-        outcome = measure_pair(&resistance_pairs[i], &line_mohm[i], &bus_mv);
+        outcome = measure_pair(&resistance_pairs[i], &line_mohm[i],
+                               &bus_mv, &sag_mv);
         if (outcome != ESTIMATE_OK) {
             break;
         }
 
         bus_total += bus_mv;
+
+        if (sag_mv > worst_sag) {
+            worst_sag = sag_mv;
+        }
     }
 
     rest_bridge();
@@ -560,6 +483,7 @@ uint8_t estimate_resistance(motor_t *m,
     result_out->bc_mohm = line_mohm[ESTIMATE_PAIR_BC];
     result_out->ca_mohm = line_mohm[ESTIMATE_PAIR_CA];
     result_out->bus_mv  = bus_total / 3u;
+    result_out->sag_mv  = worst_sag;
 
     result_out->a_mohm = solve_phase(result_out->ab_mohm,
                                      result_out->ca_mohm,
@@ -598,46 +522,274 @@ uint8_t estimate_resistance(motor_t *m,
 
     return ESTIMATE_OK;
 }
-
 /* ------------------------------------------------------------------
  * Inductance
+ *
+ * Unlike the resistance measurement above, this drives all three phases
+ * as a vector. It has to: the two axes must be excited while the rotor
+ * is HELD, and only a three-phase drive can hold it on one axis while
+ * exciting another.
+ *
+ * An earlier version drove two phases against each other for Lq, with
+ * the field ninety electrical degrees from where the rotor was sitting
+ * and nothing holding it there. The rotor simply turned to the field --
+ * eighty degrees of it inside four milliseconds, on a motor this board
+ * drives -- so by the end the axis being measured was no longer the q
+ * axis, and the back EMF on the way there swamped an excitation worth
+ * tens of millivolts. That is not a tuning problem; a torque-producing
+ * field applied to a free rotor for milliseconds always ends that way.
+ *
+ * Holding a d-axis current and superimposing an ALTERNATING q-axis
+ * excitation fixes it at the root. The d current is a restoring spring
+ * -- the rotor sits where it points -- and the alternating q excitation
+ * averages to no torque at all, at a frequency far above anything the
+ * rotor can follow. The rotor stays put, and the q axis stays the q
+ * axis.
  * ------------------------------------------------------------------ */
 
-/* How long the measuring pulse lasts, in microseconds. A whole number of
- * control periods, each 1000000 / LOOP_RATE_HZ microseconds. */
-#define PULSE_MICROSECONDS \
-    ((ESTIMATE_PULSE_PERIODS * 1000000u) / LOOP_RATE_HZ)
+/* The bridge's resting point, in parts per thousand.
+ *
+ * With all three phases at half duty the terminals sit at the same
+ * potential and no current flows, so this is the zero of every
+ * perturbation below. It is also what lets the excitation be applied in
+ * both directions: a bridge cannot drive a phase below the negative
+ * rail, so a signed demand has to sit on a bias. */
+#define RESTING_DUTY (GATE_DRIVER_DUTY_SCALE / 2u)
 
-/* Raise the along-axis duty until the holding current arrives.
+/* The d-axis current the rotor is held with, in milliamps, and how long
+ * to let it settle there.
  *
- * Also what aligns the rotor: the field points along phase A's axis
- * throughout and grows steadily, so the rotor is pulled into line as the
- * ramp climbs rather than being jerked there.
+ * A CURRENT rather than a duty. A fixed duty large enough to conduct on
+ * a 12 volt bus draws twice as much on a 24 volt one, and a duty small
+ * enough to be safe there is lost in the dead time here.
  *
- * @param duty_out  the duty that produced the target current
- * @return an ESTIMATE_ result code */
-static uint8_t ramp_to_align_current(uint16_t *duty_out)
+ * Large enough to do two jobs. It has to hold the rotor against the
+ * excitation's torque ripple and against cogging. And it has to keep
+ * every phase current away from zero: the dead time reverses sign with
+ * the current it is flowing through, so a phase that crosses zero puts
+ * a step into the one term the two halves are subtracted to cancel.
+ * At this hold the two return phases sit at an amp apiece, which leaves
+ * room for a q excitation of well over the few hundred milliamps the
+ * measurement actually uses. */
+#define HOLD_TARGET_MA 2000
+#define HOLD_SETTLE_MS 400U
+
+/* Highest d-axis perturbation the holding ramp will reach before giving
+ * up, and how long each of its steps settles and averages for.
+ *
+ * The ramp doubles as the alignment: the field points along phase A's
+ * axis throughout and grows steadily, so the rotor is drawn into line as
+ * the current comes up rather than being jerked there. */
+#define HOLD_MAX_UNIT    150
+#define HOLD_SETTLE_MS_STEP 4U
+#define HOLD_AVERAGE_MS     4U
+
+/* Where the three samples sit inside one half of the excitation, in
+ * control periods, and how long the half lasts.
+ *
+ * Three rather than two. Two would give a slope, and the difference
+ * between the rising and falling slopes would give an inductance -- but
+ * only an approximate one, because the resistive drop does not quite
+ * cancel between the halves: the current sits above its mean in the
+ * raised half and below it in the lowered half, so R times the current
+ * leaves a residue that reads as extra inductance. On a winding whose
+ * time constant is close to the half length that residue is worth tens
+ * of percent.
+ *
+ * A third sample removes it. The ratio between the two inner rises is
+ * exp(-gap / tau), which is the winding's own time constant measured
+ * from the shape of its response rather than assumed -- and with tau in
+ * hand the relation between the excitation and the slope is exact
+ * rather than first-order. It costs nothing but a third read, and it
+ * hands back the time constant as a result in its own right.
+ *
+ * No sample is taken across a duty change. The current sensor is read
+ * once per switching period at a fixed point in the cycle, and where
+ * that point falls relative to the switching ripple moves when the duty
+ * moves, so readings either side of a change differ by an amount that
+ * has nothing to do with the winding. Holding the duty constant across
+ * all three samples makes that offset a constant, which subtracts out.
+ *
+ * Twelve periods is 375 microseconds; the gap between samples is 156. */
+#define SLOPE_HALF_PERIODS  12U
+#define SLOPE_FIRST_PERIOD   1U
+#define SLOPE_MID_PERIOD     6U
+#define SLOPE_LAST_PERIOD   11U
+
+#define SLOPE_GAP_PERIODS (SLOPE_MID_PERIOD - SLOPE_FIRST_PERIOD)
+#define SLOPE_MICROSECONDS_PER_PERIOD (1000000.0f / (float)LOOP_RATE_HZ)
+
+/* Cycles run before anything is recorded, and cycles recorded.
+ *
+ * The warm-up matters: the cancellation is exact only once the current
+ * is oscillating steadily about its mean, which takes a couple of cycles
+ * to establish from the standing hold. */
+#define SLOPE_WARMUP_CYCLES 2U
+#define SLOPE_CYCLES        8U
+
+/* How far apart the rising and falling responses must be for an
+ * excitation size to count, in milliamps.
+ *
+ * This is really the precision setting. Each response is a difference
+ * between single sensor readings, so it carries around 57 milliamps of
+ * quantisation; averaging eight cycles brings that under half a percent
+ * of this figure. The excitation is raised until it is met, so asking
+ * for more here buys accuracy and pays in current.
+ *
+ * Fifteen hundred is where that trade settles on this board. The
+ * measured error across bus voltages from 12 to 48 volts and windings
+ * from 34 to 100 milliohms falls from about six percent at half this
+ * figure to under four, and stops improving above it -- while the
+ * q-axis swing it implies stays comfortably inside what the holding
+ * current can carry without a phase crossing zero. */
+#define SLOPE_MINIMUM_DIFFERENCE_MA 1500
+
+/* Above this, the two inner rises are too alike for the ratio between
+ * them to say anything about the time constant.
+ *
+ * That happens when the winding is far slower than the half it is being
+ * excited over, which is the case where the correction the ratio exists
+ * to make is negligible anyway -- so the straight-line relation is used
+ * instead of a time constant fitted to noise. */
+#define SLOPE_FLAT_RATIO 0.98f
+
+/* Excitation sizes, smallest first.
+ *
+ * Raised only until the response is large enough to measure, so a low
+ * inductance winding is never driven harder than it needs to be, and a
+ * high voltage bus is not driven as hard as a low voltage one -- the
+ * response a given size produces scales with the bus, so the entry that
+ * works on a 48 volt supply is a quarter of the one needed on a 12 volt
+ * supply. */
+static const int32_t excitation_steps[] = { 1, 2, 4, 8, 16, 32, 64 };
+#define EXCITATION_STEP_COUNT \
+    (sizeof excitation_steps / sizeof excitation_steps[0])
+
+/* One axis of the rotor frame, expressed as what it costs the bridge.
+ *
+ * The rotor is held in line with phase A, so the rotor frame and the
+ * stator frame coincide and the transforms collapse to constants -- no
+ * angle, no sine, no Park. A d-axis demand is just phase A against the
+ * other two, and a q-axis demand is just phase B against phase C.
+ *
+ * `voltage_scale` is how much axis voltage one unit of the perturbation
+ * produces, as a fraction of the bus in parts per thousand. It is the
+ * amplitude about the mean -- what ONE half of the excitation applies,
+ * which is what the inductance relation is written in terms of -- not
+ * the step between the two halves, which is twice it.
+ *
+ * It falls out of the forward transform applied to the duties
+ * themselves, which is what makes it exact: the duties are integers, so
+ * working back from what was actually written rather than from the
+ * voltage that was asked for leaves no rounding anywhere. */
+typedef struct {
+    int32_t duty_a;
+    int32_t duty_b;
+    int32_t duty_c;
+    float   voltage_scale;
+} axis_drive_t;
+
+/* d: phase A against B and C together. Its axis voltage is
+ * (2 va - vb - vc) / 3, so one unit of (2, -1, -1) is worth 2/1000 of
+ * the bus. */
+static const axis_drive_t axis_d = { 2, -1, -1, 2.0f };
+
+/* q: phase B against phase C, which is ninety electrical degrees from
+ * phase A's axis. Its axis voltage is (vb - vc) / sqrt(3), so one unit
+ * of (0, 1, -1) is worth 2/(1000 sqrt(3)) of the bus. */
+static const axis_drive_t axis_q = { 0, 1, -1, 1.1547005f };
+
+/* Clamp a signed perturbation about the resting point into a duty the
+ * bridge will accept. */
+static uint16_t duty_from_perturbation(int32_t perturbation)
 {
-    for (uint16_t duty = 1u; duty <= ALIGN_MAX_DUTY; duty++) {
+    int32_t duty = (int32_t)RESTING_DUTY + perturbation;
 
-        drive_along_axis(duty);
+    if (duty < 0) {
+        duty = 0;
+    }
+    if (duty > (int32_t)GATE_DRIVER_DUTY_MAXIMUM) {
+        duty = (int32_t)GATE_DRIVER_DUTY_MAXIMUM;
+    }
+    return (uint16_t)duty;
+}
 
-        if (wait_watching_current(ALIGN_SETTLE_MS, duty) == 0u) {
+/* Drive a holding vector along phase A's axis with an excitation
+ * superimposed on one axis.
+ *
+ * @param hold        d-axis holding size, in perturbation units
+ * @param axis        which axis the excitation acts on
+ * @param excitation  signed excitation size, in perturbation units */
+static void apply_vector(int32_t hold, const axis_drive_t *axis,
+                         int32_t excitation)
+{
+    gate_driver_set_duty(GATE_DRIVER_PHASE_A,
+        duty_from_perturbation((2 * hold) + (axis->duty_a * excitation)));
+    gate_driver_set_duty(GATE_DRIVER_PHASE_B,
+        duty_from_perturbation((-hold) + (axis->duty_b * excitation)));
+    gate_driver_set_duty(GATE_DRIVER_PHASE_C,
+        duty_from_perturbation((-hold) + (axis->duty_c * excitation)));
+}
+
+/* The current along one axis, in milliamps.
+ *
+ * With the rotor held in line with phase A the d-axis current is simply
+ * phase A's, and the q-axis current is the other two differenced --
+ * (ia + 2 ib) / sqrt(3), which is the forward transform with the angle
+ * set to zero. Phase C has no sensor and is not needed for either. */
+static int32_t axis_current_ma(const axis_drive_t *axis,
+                               int32_t current_a_ma,
+                               int32_t current_b_ma)
+{
+    if (axis == &axis_q) {
+        return (int32_t)(((float)current_a_ma + (2.0f * (float)current_b_ma))
+                         * 0.57735027f);
+    }
+    return current_a_ma;
+}
+
+/* Spin until the control loop has run the given number of periods.
+ *
+ * Against the loop's iteration counter rather than the millisecond tick,
+ * because everything here is timed in tens of microseconds and the tick
+ * has no resolution at that scale. */
+static void wait_periods(uint32_t periods)
+{
+    uint32_t start = loop_get_iteration_count();
+
+    while ((loop_get_iteration_count() - start) < periods) {
+        /* The loop's ISR is the only thing that advances this. */
+    }
+}
+
+/* Raise the d-axis holding current until it arrives, aligning the rotor
+ * as it climbs.
+ *
+ * @param hold_out  the perturbation size that produced the target
+ * @return an ESTIMATE_ result code */
+static uint8_t ramp_to_hold_current(int32_t *hold_out)
+{
+    for (int32_t hold = 1; hold <= HOLD_MAX_UNIT; hold++) {
+
+        apply_vector(hold, &axis_d, 0);
+
+        if (wait_watching_current(HOLD_SETTLE_MS_STEP,
+                                  (uint16_t)hold) == 0u) {
             return ESTIMATE_ERR_OVERCURRENT;
         }
 
         int32_t measured;
         if (average_phase_current(GATE_DRIVER_PHASE_A, 1,
-                                  ALIGN_AVERAGE_MS, duty,
+                                  HOLD_AVERAGE_MS, (uint16_t)hold,
                                   &measured) == 0u) {
             return ESTIMATE_ERR_OVERCURRENT;
         }
 
-        fault_duty       = duty;
+        fault_duty       = (uint16_t)hold;
         fault_current_ma = measured;
 
-        if (measured >= ALIGN_TARGET_MA) {
-            *duty_out = duty;
+        if (measured >= HOLD_TARGET_MA) {
+            *hold_out = hold;
             return ESTIMATE_OK;
         }
     }
@@ -648,229 +800,217 @@ static uint8_t ramp_to_align_current(uint16_t *duty_out)
     return ESTIMATE_ERR_TOO_SMALL;
 }
 
-/* Step the voltage up and measure how fast the current climbs.
+/* Drive one half of the excitation and read the two inner rises.
  *
- * The step is taken from a duty that is ALREADY passing a settled
- * current, not up from zero. Two things follow from that. The dead time
- * removes the same slice of voltage before and after, so it cancels in
- * the difference -- the same reasoning the resistance measurement's two
- * points rest on. And the current starts from its own steady state, so
- * the response to the step is a clean single exponential from a known
- * starting point, which is what estimate_inductance()'s inversion
- * assumes.
- *
- * Timed against the control loop's iteration counter rather than the
- * millisecond tick, because the pulse is a quarter of a millisecond long
- * and the tick has no resolution at that scale.
- *
- * @param phase       which phase's sensor carries the current
- * @param hold_duty   duty already applied, and the baseline to step from
- * @param step        how much to add for the pulse
- * @param along_axis  1 to pulse along phase A's axis, 0 to pulse across
- * @param change_out  current change in milliamps, signed
+ * @param hold        d-axis holding size
+ * @param axis        which axis the excitation acts on
+ * @param excitation  signed excitation size for this half
+ * @param first_out   rise from the first sample to the second
+ * @param second_out  rise from the second sample to the third
  * @return 1 on success, 0 if the current exceeded the limit */
-static uint8_t pulse_and_measure(uint8_t   phase,
-                                 uint16_t  hold_duty,
-                                 uint16_t  step,
-                                 uint8_t   along_axis,
-                                 int32_t  *change_out)
+static uint8_t half_cycle(int32_t               hold,
+                          const axis_drive_t   *axis,
+                          int32_t               excitation,
+                          int32_t              *first_out,
+                          int32_t              *second_out)
 {
-    int32_t  current_a;
-    int32_t  current_b;
-    uint32_t start_iteration;
-    uint32_t elapsed;
+    int32_t current_a;
+    int32_t current_b;
 
+    apply_vector(hold, axis, excitation);
+
+    wait_periods(SLOPE_FIRST_PERIOD);
     sensors_get_currents(&current_a, &current_b);
-    int32_t before = phase_current_ma(phase, current_a, current_b);
+    int32_t first = axis_current_ma(axis, current_a, current_b);
 
-    start_iteration = loop_get_iteration_count();
-
-    if (along_axis != 0u) {
-        drive_along_axis((uint16_t)(hold_duty + step));
-    } else {
-        drive_across_axis((uint16_t)(hold_duty + step));
-    }
-
-    do {
-        elapsed = loop_get_iteration_count() - start_iteration;
-    } while (elapsed < ESTIMATE_PULSE_PERIODS);
-
+    wait_periods(SLOPE_MID_PERIOD - SLOPE_FIRST_PERIOD);
     sensors_get_currents(&current_a, &current_b);
-    int32_t after = phase_current_ma(phase, current_a, current_b);
+    int32_t middle = axis_current_ma(axis, current_a, current_b);
 
-    /* Back to the holding duty immediately, so the current stops
-     * climbing the moment the measurement is over. */
-    if (along_axis != 0u) {
-        drive_along_axis(hold_duty);
-    } else {
-        drive_across_axis(hold_duty);
-    }
-
-    *change_out = after - before;
-
+    wait_periods(SLOPE_LAST_PERIOD - SLOPE_MID_PERIOD);
+    sensors_get_currents(&current_a, &current_b);
+    int32_t last    = axis_current_ma(axis, current_a, current_b);
     int32_t largest = largest_phase_current_ma(current_a, current_b);
 
+    wait_periods(SLOPE_HALF_PERIODS - SLOPE_LAST_PERIOD);
+
+    *first_out  = middle - first;
+    *second_out = last - middle;
+
     if (largest > ESTIMATE_CURRENT_LIMIT_MA) {
-        fault_duty       = (uint16_t)(hold_duty + step);
         fault_current_ma = largest;
         return 0u;
     }
     return 1u;
 }
 
-/* Turn one pulse into an inductance.
+/* Turn a pair of averaged rises into an inductance.
  *
- * The current in an R-L winding stepped by V from its own steady state
- * goes as dI(t) = (V/R)(1 - exp(-t R / L)), so
+ * WHAT THE TWO NUMBERS ARE
  *
- *     L = -t R / ln(1 - dI R / V)
+ *   `first` and `second` are the current's rise over the two halves of
+ *   the sampling window, each already differenced between the raised and
+ *   lowered excitation. Differencing kills everything that is common to
+ *   the two: the resistive drop at the mean current, the dead time, any
+ *   back EMF, and any fixed offset in the sensor.
  *
- * which is what this computes. The naive L = V t / dI is the first term
- * of that expansion and is only honest while t is far below L/R, which
- * on this board it is not -- see the note at the top of estimate.h.
+ * THE TIME CONSTANT
  *
- * @param series_mohm    the resistance the pulse actually saw, milliohms
- * @param step_mv        the voltage step, millivolts
- * @param change_ma      the current change it produced, milliamps
- * @param series_nh_out  the series inductance, nanohenries. Left as a
- *                       float so the geometry factor divides into it
- *                       before anything is rounded.
- * @return an ESTIMATE_ result code */
-static uint8_t invert_pulse(uint32_t  series_mohm,
-                            uint32_t  step_mv,
-                            int32_t   change_ma,
-                            float    *series_nh_out)
+ *   What survives differencing is the winding's own response, which is
+ *   exponential. So the ratio of the second rise to the first is
+ *   exp(-gap / tau), and
+ *
+ *       tau = -gap / ln(second / first)
+ *
+ *   needs no voltage, no resistance and no clock beyond the control
+ *   loop's own.
+ *
+ * THE INDUCTANCE
+ *
+ *   With tau known, the steady-state response of an R-L winding to a
+ *   square wave of amplitude V about its mean gives, between samples at
+ *   a and b inside a half of length h,
+ *
+ *       difference = (V tau / L) (4 / (1 + exp(-h/tau)))
+ *                    (exp(-a/tau) - exp(-b/tau))
+ *
+ *   which rearranges for L. The awkward-looking factor is what a step
+ *   response does NOT have: the current here starts each half from where
+ *   the previous one left it, not from rest, and (1 + exp(-h/tau)) is
+ *   the price of that. As the winding gets slow relative to the half,
+ *   the whole expression collapses to L = V (b - a) / difference, which
+ *   is the straight-line answer.
+ *
+ * @param step_voltage_mv  the axis voltage one half applies, about the
+ *                         mean
+ * @param first_ma         differenced rise over the first gap
+ * @param second_ma        differenced rise over the second gap
+ * @param tau_us_out       the winding's time constant, 0 if not fitted
+ * @return the inductance in nanohenries, or 0 if it could not be found */
+static uint32_t inductance_from_rises(float   step_voltage_mv,
+                                      int32_t first_ma,
+                                      int32_t second_ma,
+                                      uint32_t *tau_us_out)
 {
-    if ((step_mv == 0u) || (series_mohm == 0u)) {
-        return ESTIMATE_ERR_ARGUMENT;
+    const float period_us = SLOPE_MICROSECONDS_PER_PERIOD;
+    const float gap_us    = (float)SLOPE_GAP_PERIODS * period_us;
+    const float a_us      = (float)SLOPE_FIRST_PERIOD * period_us;
+    const float b_us      = (float)SLOPE_LAST_PERIOD * period_us;
+    const float half_us   = (float)SLOPE_HALF_PERIODS * period_us;
+
+    float total = (float)first_ma + (float)second_ma;
+
+    if ((total <= 0.0f) || (first_ma <= 0)) {
+        *tau_us_out = 0u;
+        return 0u;
     }
 
-    float series_ohm = (float)series_mohm * 0.001f;
-    float step_volts = (float)step_mv * 0.001f;
-    float change_amp = (float)absolute(change_ma) * 0.001f;
+    float ratio = (float)second_ma / (float)first_ma;
+    float inductance_uh;
 
-    /* How far along its exponential the current got, as a fraction of
-     * where it would have ended up. */
-    float settled = (change_amp * series_ohm) / step_volts;
+    if ((ratio >= SLOPE_FLAT_RATIO) || (ratio <= 0.0f)) {
+        /* No usable curvature: the winding is slow enough that the
+         * straight-line relation is the right answer. */
+        *tau_us_out   = 0u;
+        inductance_uh = (2.0f * step_voltage_mv * (b_us - a_us)) / total;
+    } else {
+        float tau_us = -gap_us / logf(ratio);
 
-    if (settled >= PULSE_SETTLED_FRACTION_LIMIT) {
-        return ESTIMATE_ERR_PULSE_TOO_LONG;
+        *tau_us_out = (uint32_t)tau_us;
+
+        inductance_uh = (step_voltage_mv * tau_us * 4.0f
+                         * (expf(-a_us / tau_us) - expf(-b_us / tau_us)))
+                        / (total * (1.0f + expf(-half_us / tau_us)));
     }
-    if (settled <= 0.0f) {
-        return ESTIMATE_ERR_TOO_SMALL;
+
+    if (inductance_uh <= 0.0f) {
+        return 0u;
     }
-
-    /* Microseconds times ohms gives microhenries, so the thousand is
-     * all that stands between that and nanohenries. */
-    float tau_us = -(float)PULSE_MICROSECONDS / logf(1.0f - settled);
-
-    *series_nh_out = tau_us * series_ohm * 1000.0f;
-
-    return ESTIMATE_OK;
+    return (uint32_t)((inductance_uh * 1000.0f) + 0.5f);
 }
 
-/* Measure the inductance along one axis, raising the pulse until the
- * current change is large enough to trust.
+/* Measure the inductance along one axis, raising the excitation until
+ * the response is large enough to trust.
  *
- * @param phase           which phase's sensor carries the current
- * @param hold_duty       duty already applied, stepped up from
- * @param along_axis      1 for phase A's own axis, 0 for across it
- * @param phases_doubled  how many phases the current passes through in
- *                        this topology, times two -- 3 for A against B
- *                        and C in parallel, 4 for B against C. Kept
- *                        doubled so the division stays in integers.
- * @param inductance_out  per-axis result in nanohenries
- * @param change_out      the current change that produced it
- * @param step_out        the pulse step that was needed
- * @param series_mohm_out the series resistance it was solved against
+ * @param hold            d-axis holding size, kept throughout
+ * @param axis            which axis to excite
+ * @param bus_mv          the bus the excitation is a fraction of
+ * @param inductance_out  result in nanohenries
+ * @param difference_out  the differenced response that produced it
+ * @param step_out        the excitation size that was needed
+ * @param tau_us_out      the winding's time constant on this axis
  * @return an ESTIMATE_ result code */
-static uint8_t measure_axis(uint8_t   phase,
-                            uint16_t  hold_duty,
-                            uint8_t   along_axis,
-                            uint32_t  phases_doubled,
-                            uint32_t *inductance_out,
-                            int32_t  *change_out,
-                            uint16_t *step_out,
-                            uint32_t *series_mohm_out)
+static uint8_t measure_axis(int32_t             hold,
+                            const axis_drive_t *axis,
+                            uint32_t            bus_mv,
+                            uint32_t           *inductance_out,
+                            int32_t            *difference_out,
+                            uint16_t           *step_out,
+                            uint32_t           *tau_us_out)
 {
-    uint32_t bus_mv = sensors_get_bus_mv();
+    for (uint32_t i = 0u; i < EXCITATION_STEP_COUNT; i++) {
 
-    /* The pulse passes through more than one phase's worth of winding,
-     * and through the same amount of each. The per-phase resistance the
-     * motor carries scales up by the same factor the inductance will
-     * scale back down by. */
-    uint32_t phase_mohm =
-        (uint32_t)((motor->resistance_ohm * 1000.0f) + 0.5f);
-    uint32_t series_mohm = (phase_mohm * phases_doubled) / 2u;
+        int32_t step = excitation_steps[i];
+        int32_t raised_first;
+        int32_t raised_second;
+        int32_t lowered_first;
+        int32_t lowered_second;
 
-    *series_mohm_out = series_mohm;
-
-    uint8_t last = ESTIMATE_ERR_TOO_SMALL;
-
-    for (uint32_t i = 0u; i < PULSE_STEP_COUNT; i++) {
-
-        /* Several pulses at this step, averaged. Each one's change is a
-         * difference between two single sensor readings, so repeating
-         * is the cheapest precision available -- the pulse itself lasts
-         * a quarter of a millisecond. */
-        int32_t total = 0;
-
-        for (uint32_t repeat = 0u; repeat < ESTIMATE_PULSE_REPEATS; repeat++) {
-
-            int32_t one_change;
-
-            if (pulse_and_measure(phase, hold_duty, pulse_steps[i],
-                                  along_axis, &one_change) == 0u) {
-                return ESTIMATE_ERR_OVERCURRENT;
-            }
-
-            total += one_change;
-
-            /* Let the current fall back to its holding value before the
-             * next pulse, so every one of them steps from the same
-             * place. */
-            if (wait_watching_current(ESTIMATE_PULSE_RECOVERY_MS,
-                                      hold_duty) == 0u) {
+        for (uint32_t warm = 0u; warm < SLOPE_WARMUP_CYCLES; warm++) {
+            if ((half_cycle(hold, axis,  step,
+                            &raised_first, &raised_second) == 0u)
+                || (half_cycle(hold, axis, -step,
+                               &lowered_first, &lowered_second) == 0u)) {
                 return ESTIMATE_ERR_OVERCURRENT;
             }
         }
 
-        int32_t change = total / (int32_t)ESTIMATE_PULSE_REPEATS;
+        int64_t first_total  = 0;
+        int64_t second_total = 0;
 
-        *change_out = change;
-        *step_out   = pulse_steps[i];
-
-        if (absolute(change) < ESTIMATE_MINIMUM_CURRENT_CHANGE_MA) {
-            last = ESTIMATE_ERR_TOO_SMALL;
-            continue;                     /* too small to trust; try harder */
+        for (uint32_t cycle = 0u; cycle < SLOPE_CYCLES; cycle++) {
+            if ((half_cycle(hold, axis,  step,
+                            &raised_first, &raised_second) == 0u)
+                || (half_cycle(hold, axis, -step,
+                               &lowered_first, &lowered_second) == 0u)) {
+                return ESTIMATE_ERR_OVERCURRENT;
+            }
+            first_total  += (int64_t)raised_first  - (int64_t)lowered_first;
+            second_total += (int64_t)raised_second - (int64_t)lowered_second;
         }
 
-        /* Only the STEP counts as the applied voltage: the holding duty
-         * was already there before the pulse and is still there after,
-         * so it drives no change. */
-        uint32_t step_mv =
-            (bus_mv * pulse_steps[i]) / GATE_DRIVER_DUTY_SCALE;
+        /* Back to the plain hold before anything else happens. */
+        apply_vector(hold, axis, 0);
 
-        float series_nh;
+        int32_t first  = (int32_t)(first_total  / (int64_t)SLOPE_CYCLES);
+        int32_t second = (int32_t)(second_total / (int64_t)SLOPE_CYCLES);
 
-        last = invert_pulse(series_mohm, step_mv, change, &series_nh);
-        if (last != ESTIMATE_OK) {
-            /* A pulse that has outrun the winding will do so at every
-             * step size -- the fraction settled does not depend on how
-             * hard the step is -- so there is nothing to gain by trying
-             * a bigger one. */
-            return last;
+        *difference_out = first + second;
+        *step_out       = (uint16_t)step;
+
+        if ((first + second) < SLOPE_MINIMUM_DIFFERENCE_MA) {
+            continue;                     /* too small to trust; drive harder */
         }
 
-        /* Divide out the topology to get back to one axis, rounding
-         * once, here, rather than at each step of the arithmetic. */
-        *inductance_out =
-            (uint32_t)(((series_nh * 2.0f) / (float)phases_doubled) + 0.5f);
+        /* The axis voltage one half of the excitation applies, worked
+         * back from the duties actually written rather than from what
+         * was asked for, so the integer rounding in them is not an
+         * error here. */
+        float step_voltage_mv =
+            ((float)bus_mv * (float)step * axis->voltage_scale) / 1000.0f;
 
+        uint32_t nanohenries = inductance_from_rises(step_voltage_mv,
+                                                     first, second,
+                                                     tau_us_out);
+        if (nanohenries == 0u) {
+            continue;
+        }
+
+        *inductance_out = nanohenries;
         return ESTIMATE_OK;
     }
 
-    return last;
+    return ESTIMATE_ERR_TOO_SMALL;
 }
 
 uint8_t estimate_inductance(motor_t *m,
@@ -885,101 +1025,74 @@ uint8_t estimate_inductance(motor_t *m,
         return ESTIMATE_ERR_NOT_READY;
     }
 
-    /* The inversion is in terms of R, so there is no answer at all
-     * without one. Refusing is the honest response; the alternative is
-     * the straight-line approximation, which reads high and collapses
-     * the two axes onto each other. */
-    if (motor->resistance_ohm <= 0.0f) {
-        return ESTIMATE_ERR_NEED_RESISTANCE;
-    }
-
     fault_pair       = ESTIMATE_PAIR_NONE;
     fault_duty       = 0u;
     fault_current_ma = 0;
 
-    result_out->inductance_d_nh     = 0u;
-    result_out->inductance_q_nh     = 0u;
-    result_out->saliency_percent    = 0u;
-    result_out->d_current_change_ma = 0;
-    result_out->q_current_change_ma = 0;
-    result_out->d_duty_used         = 0u;
-    result_out->q_duty_used         = 0u;
-    result_out->d_series_mohm       = 0u;
-    result_out->q_series_mohm       = 0u;
+    result_out->inductance_d_nh  = 0u;
+    result_out->inductance_q_nh  = 0u;
+    result_out->saliency_percent = 0u;
+    result_out->d_difference_ma  = 0;
+    result_out->q_difference_ma  = 0;
+    result_out->d_duty_used      = 0u;
+    result_out->q_duty_used      = 0u;
+    result_out->d_tau_us         = 0u;
+    result_out->q_tau_us         = 0u;
+    result_out->hold_duty        = 0u;
 
     enable_bridge();
 
-    /* Pull the rotor into line with phase A's axis by ramping the
-     * current up to the holding target, then let it settle there. The
-     * field points where the rotor is asked to go, so once it arrives
-     * there is no torque left and it stays put. */
-    uint16_t align_duty = 0u;
+    /* Draw the rotor into line with phase A's axis and hold it there.
+     * The field points where the rotor is asked to go, so once it
+     * arrives there is no torque left and it stays. */
+    int32_t hold = 0;
 
-    uint8_t aligned = ramp_to_align_current(&align_duty);
-    if (aligned != ESTIMATE_OK) {
+    uint8_t held = ramp_to_hold_current(&hold);
+    if (held != ESTIMATE_OK) {
         rest_bridge();
         HAL_Delay(DECAY_MS);
         gate_driver_disable_all();
-        return aligned;
+        return held;
     }
 
-    if (wait_watching_current(ALIGN_MS, align_duty) == 0u) {
+    result_out->hold_duty = (uint16_t)hold;
+
+    if (wait_watching_current(HOLD_SETTLE_MS, (uint16_t)hold) == 0u) {
         HAL_Delay(DECAY_MS);
         gate_driver_disable_all();
         return ESTIMATE_ERR_OVERCURRENT;
     }
 
-    /* Along the magnet axis. The pulse points the same way the rotor is
-     * already aligned, so it produces no torque and the rotor does not
-     * move. Current passes through A and then B and C in parallel. */
-    uint8_t outcome = measure_axis(GATE_DRIVER_PHASE_A, align_duty, 1u,
-                                   ALONG_AXIS_PHASES_DOUBLED,
+    /* Read the bus with the holding current flowing rather than before
+     * it: the supply sags once the measurement starts drawing amps, and
+     * the voltage that matters is the one actually available. */
+    uint32_t bus_mv = sensors_get_bus_mv();
+
+    /* Along the magnet axis. The excitation points the way the rotor is
+     * already aligned, so it adds no torque at all. */
+    uint8_t outcome = measure_axis(hold, &axis_d, bus_mv,
                                    &result_out->inductance_d_nh,
-                                   &result_out->d_current_change_ma,
+                                   &result_out->d_difference_ma,
                                    &result_out->d_duty_used,
-                                   &result_out->d_series_mohm);
-    if (outcome != ESTIMATE_OK) {
-        rest_bridge();
-        HAL_Delay(DECAY_MS);
-        gate_driver_disable_all();
-        return outcome;
+                                   &result_out->d_tau_us);
+
+    if (outcome == ESTIMATE_OK) {
+        /* Across the magnet axis, with the SAME holding current still
+         * pinning the rotor in place. The excitation alternates, so the
+         * torque it produces averages to nothing, and it alternates at
+         * well over a kilohertz -- hundreds of times faster than the
+         * rotor's own resonance in the holding field, which is where the
+         * rotor's inability to follow it comes from.
+         *
+         * Measured independently of the d axis rather than assumed equal
+         * to it: the difference between the two is the saliency, which
+         * is the whole reason for taking two measurements. */
+        outcome = measure_axis(hold, &axis_q, bus_mv,
+                               &result_out->inductance_q_nh,
+                               &result_out->q_difference_ma,
+                               &result_out->q_duty_used,
+                               &result_out->q_tau_us);
     }
-
-    /* Across the magnet axis: phase A floated so the current has only
-     * one path, B to C, ninety electrical degrees from where the rotor
-     * is sitting.
-     *
-     * That direction produces maximum torque, so the pre-hold is kept to
-     * a couple of milliseconds -- several time constants, so the current
-     * is settled and the pulse steps from a known baseline, but far too
-     * short for the rotor to accelerate anywhere that matters.
-     *
-     * The same duty is reused rather than re-ramped: this topology puts
-     * two phases in series where the other put one and a half, so the
-     * holding current comes out three quarters of what it was. The
-     * baseline only has to be steady and conducting, not any particular
-     * value, and re-ramping here would mean ramping under full torque.
-     *
-     * Measured independently of the d-axis rather than assumed equal to
-     * it: the difference between the two is the saliency, which is the
-     * whole reason for taking two measurements instead of one. */
-    rest_bridge();
-    HAL_Delay(DECAY_MS);
-    gate_driver_disable_phase(GATE_DRIVER_PHASE_A);
-
-    drive_across_axis(align_duty);
-    if (wait_watching_current(ACROSS_PREHOLD_MS, align_duty) == 0u) {
-        HAL_Delay(DECAY_MS);
-        gate_driver_disable_all();
-        return ESTIMATE_ERR_OVERCURRENT;
-    }
-
-    outcome = measure_axis(GATE_DRIVER_PHASE_B, align_duty, 0u,
-                           ACROSS_AXIS_PHASES_DOUBLED,
-                           &result_out->inductance_q_nh,
-                           &result_out->q_current_change_ma,
-                           &result_out->q_duty_used,
-                           &result_out->q_series_mohm);
 
     rest_bridge();
     HAL_Delay(DECAY_MS);
@@ -1016,13 +1129,11 @@ const char *estimate_pair_text(uint8_t pair)
 const char *estimate_result_text(uint8_t result)
 {
     switch (result) {
-        case ESTIMATE_OK:                  return "ok";
-        case ESTIMATE_ERR_NOT_READY:       return "control_loop_not_running";
-        case ESTIMATE_ERR_TOO_SMALL:       return "current_change_too_small";
-        case ESTIMATE_ERR_OVERCURRENT:     return "overcurrent";
-        case ESTIMATE_ERR_ARGUMENT:        return "bad_argument";
-        case ESTIMATE_ERR_NEED_RESISTANCE: return "measure_resistance_first";
-        case ESTIMATE_ERR_PULSE_TOO_LONG:  return "pulse_outlasted_winding";
-        default:                           return "unknown";
+        case ESTIMATE_OK:              return "ok";
+        case ESTIMATE_ERR_NOT_READY:   return "control_loop_not_running";
+        case ESTIMATE_ERR_TOO_SMALL:   return "current_change_too_small";
+        case ESTIMATE_ERR_OVERCURRENT: return "overcurrent";
+        case ESTIMATE_ERR_ARGUMENT:    return "bad_argument";
+        default:                       return "unknown";
     }
 }

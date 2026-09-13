@@ -59,31 +59,40 @@
  *   winding. The same trick covers the inductance pulses, which step
  *   between two duties rather than up from zero.
  *
- * WHY INDUCTANCE NEEDS THE RESISTANCE
+ * HOW INDUCTANCE IS MEASURED
  *
- *   The textbook L = V t / dI holds only while the pulse is far shorter
- *   than the winding's own L/R time constant. On this board it is not:
- *   the pulse is a quarter of a millisecond and the time constant is
- *   about the same, so the current is already well into its exponential
- *   bend by the time it is read.
+ *   Not by stepping the voltage once and dividing. L = V t / dI holds
+ *   only while the step is far shorter than the winding's own L/R time
+ *   constant, and on this board it is not -- the shortest step the
+ *   control loop can time is a quarter of a millisecond and the time
+ *   constant is about the same. A version of this file did that, needed
+ *   the resistance to correct for it, and still reported the two axes
+ *   as identical, because a step that has half settled tends towards
+ *   V/R, which is the same on both axes.
  *
- *   Two things go wrong if that is ignored. The inductance comes out
- *   high -- by about sixty percent, on the motor this was developed
- *   against -- because the current rose less than a straight line
- *   through the origin would predict. Worse, the answer stops depending
- *   on the inductance at all as the pulse lengthens: the current settles
- *   towards V/R, which is the same on both axes, so Ld and Lq converge
- *   and the saliency reads 100 percent whatever the rotor is actually
- *   built like. That is exactly the failure this file was rewritten to
- *   remove.
+ *   Instead the duty is SQUARED about a steady holding current -- up by
+ *   a step, down by a step, over and over -- and the current's slope is
+ *   measured in each half. The winding obeys
  *
- *   The honest inversion is the exponential one,
+ *       L di/dt = v - R i - e
  *
- *       L = -t R / ln(1 - dI R / V)
+ *   with e whatever the rotor's motion induces. Subtracting the falling
+ *   slope from the rising one leaves
  *
- *   which is exact at any pulse length and reduces to V t / dI when the
- *   pulse is short. It needs R, so estimate_inductance() refuses to run
- *   until estimate_resistance() has supplied one.
+ *       L (di/dt|up - di/dt|down) = 2 V_step
+ *
+ *   and nothing else. The resistive drop, the dead time, the back EMF
+ *   and any fixed offset in the sensor are all identical in the two
+ *   halves and subtract away. So the inductance needs no resistance
+ *   measurement, no dead-time figure, and no assumption that the rotor
+ *   held still -- only the bus voltage, the step, and a clock.
+ *
+ *   Two conditions make that exact rather than approximate, and both are
+ *   arranged for. The oscillation must be steady, so that the current
+ *   has the same average in both halves; a few warm-up cycles see to
+ *   that. And the current must not cross zero, since the dead time
+ *   reverses with it; the excitation swings about a hold several times
+ *   larger than the swing.
  */
 
 #ifndef ESTIMATE_H_
@@ -93,54 +102,16 @@
 
 #include "motor.h"
 
-/* Control periods the measuring pulse lasts. Eight is a quarter of a
- * millisecond.
+/* How far the current must move for a resistance point to count, in
+ * milliamps.
  *
- * Long enough that the current change is well above the sensor's
- * resolution. There is no upper bound from the arithmetic, since the
- * inversion is exact at any length -- but there is one from the
- * conditioning: once the current has all but settled, the answer stops
- * depending on the inductance and a couple of counts of noise move it
- * a long way. PULSE_SETTLED_FRACTION_LIMIT in estimate.c is where that
- * is caught. A quarter of a millisecond leaves a motor this board
- * drives around sixty percent settled, which is comfortably short of
- * it. */
-#define ESTIMATE_PULSE_PERIODS 8U
-
-/* How far the current must move for a pulse to count, in milliamps.
+ * The two points the slope is taken between are twenty-millisecond
+ * averages aimed two amps apart, so falling short of this means
+ * something went wrong rather than that the answer is merely coarse.
  *
- * The sensor resolves about 40 milliamps per count, and the change is a
- * difference between two single readings, so it carries the quantisation
- * of both. At this threshold that is around five percent, and the pulse
- * step is raised until it is met -- so the number is really a floor on
- * the precision of the answer rather than a validity check.
- *
- * It sets the operating point across a range of boards, not just this
- * one: the current change scales with the bus and with the step
- * together, so demanding a fixed change picks a small step on a high
- * voltage bus and a large one on a low voltage bus, and arrives at the
- * same signal-to-noise either way.
- *
- * The resistance measurement checks its own two-point change against
- * this as well, where it is a much weaker condition: those two points
- * are averages over twenty milliseconds each and are aimed two amps
- * apart, so failing it means something went wrong rather than that the
- * answer is merely coarse. */
+ * The inductance measurement has its own threshold, on the difference
+ * between its two slopes, in estimate.c. */
 #define ESTIMATE_MINIMUM_CURRENT_CHANGE_MA 800
-
-/* How many times each measuring pulse is repeated and averaged.
- *
- * Four readings of the change instead of one, which halves what the
- * sensor's quantisation contributes. Kept small because the across-axis
- * pulse runs under full torque: four pulses and their recovery dwells
- * come to about five milliseconds, which is far too short for the rotor
- * to move anywhere that would matter. */
-#define ESTIMATE_PULSE_REPEATS 4U
-
-/* How long the current is given to fall back to its holding value
- * between repeated pulses, in milliseconds. Several L/R time constants
- * on any winding this board would drive. */
-#define ESTIMATE_PULSE_RECOVERY_MS 1U
 
 /* Current at which a measurement is abandoned, in milliamps. */
 #define ESTIMATE_CURRENT_LIMIT_MA 6000
@@ -163,8 +134,6 @@
 #define ESTIMATE_ERR_TOO_SMALL       2U  /* current never moved enough    */
 #define ESTIMATE_ERR_OVERCURRENT     3U
 #define ESTIMATE_ERR_ARGUMENT        4U
-#define ESTIMATE_ERR_NEED_RESISTANCE 5U  /* run the resistance first     */
-#define ESTIMATE_ERR_PULSE_TOO_LONG  6U  /* current reached its ceiling   */
 
 /* Which line-to-line pair a resistance run was on when it stopped. */
 #define ESTIMATE_PAIR_AB   0U
@@ -198,10 +167,17 @@ typedef struct {
      * a genuinely unbalanced winding or a bad connection on one phase. */
     uint32_t imbalance_percent;
 
-    /* Bus voltage while current was flowing, in millivolts. Read under
-     * load rather than before it, since the supply sags once the
+    /* Bus voltage at the lower of the two points, in millivolts. Read
+     * under load rather than before it, since the supply sags once the
      * measurement starts drawing amps. */
     uint32_t bus_mv;
+
+    /* How much further the bus had sagged by the upper point, worst of
+     * the three pairs. Subtracted from the answer rather than charged to
+     * the winding, so this is reported rather than corrected for -- but
+     * a large number says the supply, not the motor, is what limits how
+     * repeatable the measurement can be. */
+    int32_t  sag_mv;
 
     /* Where a run gave up, when one did: which pair was being measured,
      * the duty being applied, and the current there. The pair is
@@ -234,24 +210,45 @@ typedef struct {
      * measurement. */
     uint32_t saliency_percent;
 
-    /* Current change seen on each pulse, in milliamps. Reported because
-     * a small change means a noisy measurement even when it passed the
-     * threshold. */
-    int32_t  d_current_change_ma;
-    int32_t  q_current_change_ma;
+    /* How far apart the rising and falling slopes came out on each axis,
+     * in milliamps across the sampling span. This is the measurement --
+     * the inductance is just this turned the right way up -- so it is
+     * reported for the same reason a raw count is: a number close to the
+     * threshold means a noisy answer even though it passed.
+     *
+     * It is also the direct check on saliency being real. The two axes
+     * are driven at the same step, so a genuine difference in inductance
+     * shows here as a difference in slope; if these two are equal the
+     * saliency is 100 percent because the motor says so. */
+    int32_t  d_difference_ma;
+    int32_t  q_difference_ma;
 
-    /* The pulse step each axis needed, in parts per thousand. Reported
-     * separately because the two are chosen independently -- the axis
-     * with more inductance takes longer to reach the same current
-     * change and can need a larger step to get there. */
+    /* The excitation step each axis needed, in parts per thousand.
+     * Chosen independently -- the axis with more inductance gives a
+     * shallower slope at the same step and can need a larger one. */
     uint16_t d_duty_used;
     uint16_t q_duty_used;
 
-    /* The series resistance each axis was solved against, in milliohms.
-     * Reported because the answer depends on it -- see
-     * estimate_inductance() on why resistance has to be known first. */
-    uint32_t d_series_mohm;
-    uint32_t q_series_mohm;
+    /* Each axis's L/R time constant in microseconds, fitted from the
+     * shape of its own response rather than assumed.
+     *
+     * Reported because it is an independent check on the resistance:
+     * R = L / tau, worked out from this measurement alone, should agree
+     * with what estimate_resistance() found by an entirely different
+     * route. A zero means the winding was too slow for the curvature to
+     * be fitted, and the straight-line relation was used -- which is the
+     * right answer in that case, not a failure.
+     *
+     * The two axes have different time constants only because they have
+     * different inductances; the resistance is the same for both. */
+    uint32_t d_tau_us;
+    uint32_t q_tau_us;
+
+    /* The d-axis holding size the ramp settled on, in perturbation
+     * units. Reported because everything else sits on it: it is what
+     * pins the rotor, and what keeps the phase currents away from the
+     * zero crossing the dead time turns on. */
+    uint16_t hold_duty;
 } estimate_inductance_result_t;
 
 /**
@@ -283,27 +280,34 @@ typedef struct {
  * be free enough to follow; it stays put within each measurement, since
  * the field does not move while a pair is being ramped.
  *
- * @param m           the motor, whose resistance is set to the mean of
- *                    the three phases on success
+ * @param m             the motor, whose resistance is set to the mean of
+ *                      the three phases on success
+ * @param reverse_order measure C-A, B-C, A-B instead of A-B, B-C, C-A.
+ *                      A winding's resistance cannot depend on the order
+ *                      it was measured in, so running both ways is what
+ *                      separates a genuinely unbalanced motor -- the
+ *                      three answers stay with their pairs -- from
+ *                      something drifting during the test, where they
+ *                      stay with their position in the sequence
  * @param result_out  where the measurement is written, including where
  *                    it stopped if it failed
  * @return one of the ESTIMATE_ constants
  */
 uint8_t estimate_resistance(motor_t *m,
+                            uint8_t reverse_order,
                             estimate_resistance_result_t *result_out);
 
 /**
  * Measure both inductances, independently of one another.
  *
- * Holds the rotor in line with phase A, then steps the voltage along
- * that axis and reads how fast the current climbs, which gives Ld; then
- * steps it along the axis ninety electrical degrees away, which gives
- * Lq. Neither is assumed from the other, and the difference between them
- * is what the reported saliency is.
+ * Holds the rotor in line with phase A, then squares the duty about that
+ * holding current -- first along the magnet axis for Ld, then along the
+ * axis ninety electrical degrees away for Lq -- and takes the difference
+ * between the rising and falling slopes in each. See the note at the top
+ * of this file for why that difference is the whole measurement.
  *
- * Requires estimate_resistance() to have run first -- see the note at
- * the top of this file on why the inversion needs R -- and returns
- * ESTIMATE_ERR_NEED_RESISTANCE if it has not.
+ * Needs no resistance measurement and does not care whether one has been
+ * taken: resistance cancels between the two slopes.
  *
  * @param m           the motor, whose inductances are updated on success
  * @param result_out  where the measurements are written

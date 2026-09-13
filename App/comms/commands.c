@@ -696,9 +696,13 @@ static void command_eres(const protocol_args_t *args)
 {
     estimate_resistance_result_t result;
 
-    (void)args;
+    /* "eres rev" measures the three pairs in the opposite order. The
+     * answers should not move: if they follow the order rather than the
+     * pairs, what changed during the run is the motor's temperature or
+     * the supply, not the winding. */
+    uint8_t reverse = protocol_arg_matches(args, 1u, "rev", 1);
 
-    uint8_t outcome = estimate_resistance(motor, &result);
+    uint8_t outcome = estimate_resistance(motor, reverse, &result);
 
     if (outcome != ESTIMATE_OK) {
         /* The reason alone does not say whether the drive never got
@@ -730,6 +734,11 @@ static void command_eres(const protocol_args_t *args)
     protocol_reply_uint("mohm",    result.phase_mohm);
     protocol_reply_uint("imbal",   result.imbalance_percent);
     protocol_reply_uint("vbus_mv", result.bus_mv);
+    /* How far the supply sagged between the two points of the worst
+     * pair. Large enough to matter means the bench supply is limiting
+     * how repeatable this can be. */
+    protocol_reply_int("sag_mv",   result.sag_mv);
+    protocol_reply_uint("rev",     reverse);
     protocol_reply_end();
 }
 
@@ -738,10 +747,15 @@ static void command_eres(const protocol_args_t *args)
  * Measures inductance along and across the rotor's magnet axis,
  * independently of one another.
  *
- * The ratio between them decides whether rotor position can be estimated
- * by injecting a high-frequency signal: the injected current responds
- * differently with position only because the inductance does, so with no
- * difference there is nothing to detect. */
+ * Needs no resistance measurement: the excitation squares the duty about
+ * a holding current and takes the difference between the rising and
+ * falling slopes, and the resistive drop cancels between them along with
+ * the dead time and the back EMF. See estimate.h.
+ *
+ * The ratio between the two decides whether rotor position can be
+ * estimated by injecting a high-frequency signal: the injected current
+ * responds differently with position only because the inductance does,
+ * so with no difference there is nothing to detect. */
 static void command_eind(const protocol_args_t *args)
 {
     estimate_inductance_result_t result;
@@ -751,15 +765,18 @@ static void command_eind(const protocol_args_t *args)
     uint8_t outcome = estimate_inductance(motor, &result);
 
     if (outcome != ESTIMATE_OK) {
-        /* The current change each axis did manage is reported even on a
-         * failure: "too small" with a change of nearly nothing means the
-         * drive never got going, while one just under the threshold
-         * means only the pulse needs to be bigger. */
+        /* The slope difference each axis did manage is reported even on
+         * a failure: "too small" with a difference of nearly nothing
+         * means the excitation never reached the winding, while one just
+         * under the threshold means only the swing needs to be bigger.
+         * The holding duty says whether there was room to swing at all. */
         protocol_reply_begin(PROTOCOL_STATUS_ERROR, "eind");
-        protocol_reply_text("reason",  estimate_result_text(outcome));
-        protocol_reply_int("dchg_ma",  result.d_current_change_ma);
-        protocol_reply_int("qchg_ma",  result.q_current_change_ma);
-        protocol_reply_uint("ld_nh",   result.inductance_d_nh);
+        protocol_reply_text("reason",   estimate_result_text(outcome));
+        protocol_reply_int("d_slope",   result.d_difference_ma);
+        protocol_reply_int("q_slope",   result.q_difference_ma);
+        protocol_reply_uint("d_step",   result.d_duty_used);
+        protocol_reply_uint("q_step",   result.q_duty_used);
+        protocol_reply_uint("hold",     result.hold_duty);
         protocol_reply_end();
         return;
     }
@@ -767,20 +784,26 @@ static void command_eind(const protocol_args_t *args)
     protocol_reply_begin(PROTOCOL_STATUS_OK, "eind");
     protocol_reply_uint("ld_nh",  result.inductance_d_nh);
     protocol_reply_uint("lq_nh",  result.inductance_q_nh);
-    /* Saliency as a percentage: how much larger the across-axis
-     * inductance is. Under about 110 means injection will not work
-     * reliably on this motor. */
+    /* Saliency as a percentage: how much larger the q-axis inductance
+     * is than the d-axis one. Under about 110 means injection will not
+     * work reliably on this motor. */
     protocol_reply_uint("sal",    result.saliency_percent);
-    protocol_reply_int("dchg_ma", result.d_current_change_ma);
-    protocol_reply_int("qchg_ma", result.q_current_change_ma);
+    /* The two responses this was computed from, and the excitation each
+     * needed. Both are wanted to read the saliency honestly: the axes
+     * settle on whatever excitation each needs, so a real difference in
+     * inductance shows in the responses only once the steps are taken
+     * into account. */
+    protocol_reply_int("d_slope", result.d_difference_ma);
+    protocol_reply_int("q_slope", result.q_difference_ma);
     protocol_reply_uint("d_step", result.d_duty_used);
     protocol_reply_uint("q_step", result.q_duty_used);
-    /* The series resistance each axis was solved against. The answer
-     * depends on it, so it is reported rather than left implicit --
-     * a resistance measured on a cold motor and an inductance taken
-     * after a long run will not agree. */
-    protocol_reply_uint("dr_mohm", result.d_series_mohm);
-    protocol_reply_uint("qr_mohm", result.q_series_mohm);
+    protocol_reply_uint("hold",   result.hold_duty);
+    /* Each axis's time constant, fitted from the shape of its own
+     * response. R = L / tau is an independent check on eres: both axes
+     * should imply the same resistance, and it should be the one eres
+     * measured by a completely different route. */
+    protocol_reply_uint("d_tau",  result.d_tau_us);
+    protocol_reply_uint("q_tau",  result.q_tau_us);
     protocol_reply_end();
 }
 
