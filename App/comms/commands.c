@@ -824,6 +824,54 @@ static void command_eind(const protocol_args_t *args)
      * ical and a meter, because it scales the inductance directly. */
     protocol_reply_uint("quiet_mv", result.bus_quiet_mv);
     protocol_reply_uint("load_mv",  result.bus_loaded_mv);
+    /* The switching ripple this winding carries, and how close the
+     * return phases came to zero current because of it. The margin is
+     * the number that says whether to believe the rest: a phase crossing
+     * zero reverses the dead time mid-measurement, which lands in the
+     * one difference everything here depends on cancelling, and leaves
+     * no other trace. */
+    protocol_reply_uint("ripple_ma", result.ripple_ma);
+    protocol_reply_int("zmargin_ma", result.zero_margin_ma);
+    protocol_reply_end();
+}
+
+/* idir
+ *
+ * Re-runs the current sense direction check and reports what it found.
+ *
+ * The same check runs once at startup. This exists so the answer can be
+ * seen, and re-taken after the motor is reconnected -- a board powered
+ * up with nothing attached cannot tell, and says so rather than guessing
+ * a sign from noise.
+ *
+ * dir_a and dir_b are what gets applied to every reading from here on.
+ * ra_ma and rb_ma are the raw evidence: with phase A driven and phase B
+ * at ground there is one path for the current, in at A and out at B, so
+ * a correctly wired pair reads positive and negative and near mirror
+ * images of each other. */
+static void command_idir(const protocol_args_t *args)
+{
+    estimate_direction_result_t result;
+
+    (void)args;
+
+    uint8_t outcome = estimate_current_direction(&result);
+
+    protocol_reply_begin(outcome == ESTIMATE_OK ? PROTOCOL_STATUS_OK
+                                                : PROTOCOL_STATUS_ERROR,
+                         "idir");
+    if (outcome != ESTIMATE_OK) {
+        protocol_reply_text("reason", estimate_result_text(outcome));
+    }
+
+    int8_t applied_a;
+    int8_t applied_b;
+    sensors_get_direction(&applied_a, &applied_b);
+
+    protocol_reply_int("dir_a", applied_a);
+    protocol_reply_int("dir_b", applied_b);
+    protocol_reply_int("ra_ma", result.current_a_ma);
+    protocol_reply_int("rb_ma", result.current_b_ma);
     protocol_reply_end();
 }
 
@@ -868,13 +916,29 @@ static void command_eind(const protocol_args_t *args)
  *   delivering a tenth of an amp. Run this at a few duties and watch
  *   whether the meter follows the reading or stays put.
  *
- * Usage: ical <duty> [milliseconds] */
+ * Given a reference resistance as a third argument -- a power resistor
+ * of a few ohms wired between two phase outputs and measured with the
+ * LCR meter -- it goes further and reports the correction the current
+ * scaling needs, with no ammeter involved at all. Run it at several
+ * duties: a correction that is the same each time is a gain error and
+ * can simply be applied, while one that drifts with duty is a sampling
+ * error and means the current is being read somewhere other than the
+ * midpoint of its switching ripple.
+ *
+ * Usage: ical <duty> [milliseconds] [reference milliohms] */
 static void command_ical(const protocol_args_t *args)
 {
     uint32_t duty = (uint32_t)protocol_arg_int(args, 1u, 0);
     uint32_t hold_ms = (protocol_arg_count(args) > 2u)
                            ? (uint32_t)protocol_arg_int(args, 2u, 3000)
                            : 3000u;
+
+    /* Optional: the milliohms of a reference resistor wired between two
+     * phase outputs, measured with an LCR meter. Given one, this stops
+     * being a place to point a meter and becomes a calibration. */
+    uint32_t reference_mohm = (protocol_arg_count(args) > 3u)
+                           ? (uint32_t)protocol_arg_int(args, 3u, 0)
+                           : 0u;
 
     /* A ceiling rather than a clamp: this drives a dead short across two
      * windings, and a slip of the finger on the duty is the one way to
@@ -990,6 +1054,43 @@ static void command_ical(const protocol_args_t *args)
     protocol_reply_uint("quiet_mv", quiet_bus_mv);
     protocol_reply_uint("load_mv",
         (uint32_t)(total_bus / (int64_t)samples));
+
+    /* With a reference resistance given, the current that OUGHT to be
+     * flowing is known, and the ratio between it and what was read is
+     * the correction the current-sense scaling needs.
+     *
+     * This is the only route to an absolute current scale that does not
+     * need a calibrated ammeter, and everything the board reports about
+     * the motor is multiplied by it: a gain wrong by a factor puts the
+     * resistance and the inductance out by exactly the same factor, with
+     * nothing internal to contradict it.
+     *
+     * The voltage the resistor sees is the duty less the dead time,
+     * times the quiet bus. Take several duties and see whether the
+     * answer is the SAME each time -- one that drifts with duty is not a
+     * gain error but a sampling one, and means the current is being read
+     * somewhere other than the midpoint of its switching ripple. */
+    if ((reference_mohm > 0u) && (tripped == 0u)) {
+        int32_t effective = (int32_t)duty
+                            - (int32_t)GATE_DRIVER_DEAD_TIME_PER_MILLE;
+        int32_t measured_ma = (int32_t)(total_a / (int64_t)samples);
+
+        if ((effective > 0) && (measured_ma > 0)) {
+            int32_t expected_ma =
+                (int32_t)(((int64_t)quiet_bus_mv * (int64_t)effective
+                           * 1000)
+                          / ((int64_t)GATE_DRIVER_DUTY_SCALE
+                             * (int64_t)reference_mohm));
+
+            protocol_reply_uint("ref_mohm", reference_mohm);
+            protocol_reply_int("want_ma",   expected_ma);
+            /* The correction as a percentage: 100 means the scaling is
+             * right, 140 means every current is being read 1.4 times too
+             * small and every resistance and inductance with it. */
+            protocol_reply_int("gain_pct",
+                (int32_t)((expected_ma * 100) / measured_ma));
+        }
+    }
     protocol_reply_end();
 }
 
@@ -1163,6 +1264,7 @@ static const struct {
     { "comm",     0x81u, command_comm     },
     { "eres",     0x85u, command_eres     },
     { "ical",     0x88u, command_ical     },
+    { "idir",     0x89u, command_idir     },
     { "eind",     0x86u, command_eind     },
     { "param",    0x87u, command_param    },
     /* telemetry */

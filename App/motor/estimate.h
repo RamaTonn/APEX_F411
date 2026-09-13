@@ -141,6 +141,27 @@
 #define ESTIMATE_PAIR_CA   2U
 #define ESTIMATE_PAIR_NONE 255U
 
+/* How much current a direction check needs before it will commit to an
+ * answer, in milliamps. Comfortably above the sensor's noise, and far
+ * below anything a connected motor fails to produce. */
+#define ESTIMATE_DIRECTION_MINIMUM_MA 300
+
+/* What a current sense direction check produced. */
+typedef struct {
+    /* +1 if that sensor reads a current flowing INTO its phase terminal
+     * as positive, -1 if it reads it as negative. Zero if the check
+     * could not tell, in which case nothing was changed. */
+    int8_t  direction_a;
+    int8_t  direction_b;
+
+    /* What the two sensors read, BEFORE any correction, while a current
+     * of known sign was flowing. Reported because it is the evidence:
+     * phase A should read positive and phase B negative, and the two
+     * should be near mirror images. */
+    int32_t current_a_ma;
+    int32_t current_b_ma;
+} estimate_direction_result_t;
+
 /* What a resistance measurement produced.
  *
  * Three line-to-line measurements are taken -- A against B, B against C,
@@ -288,12 +309,68 @@ typedef struct {
     uint32_t bus_quiet_mv;
     uint32_t bus_loaded_mv;
 
+    /* Peak-to-peak switching ripple on the driven phase, in milliamps,
+     * computed from the inductance just measured.
+     *
+     * Not measurable directly: the sensor is read once per switching
+     * period at the midpoint of the ripple, so it reports the average
+     * and never the excursion. On a winding of a few microhenries the
+     * excursion can exceed the bias it sits on. */
+    uint32_t ripple_ma;
+
+    /* How close the two RETURN phases came to zero current, in
+     * milliamps. They carry half the driven phase's bias and half its
+     * ripple, so they reach zero first.
+     *
+     * THIS IS THE NUMBER THAT SAYS WHETHER THE ANSWER IS TRUSTWORTHY.
+     * The whole measurement rests on the dead time being identical in
+     * both halves of the excitation, and the dead time reverses sign
+     * with the current in the phase carrying it. A phase that crosses
+     * zero puts that reversal into the very difference the two halves
+     * are subtracted to cancel -- and nothing about the result looks
+     * wrong when it happens.
+     *
+     * Positive and comfortably large is what is wanted. At or below zero
+     * the answer is not to be believed; the fixes are a larger holding
+     * current, a faster switching frequency, or a smaller excitation. */
+    int32_t  zero_margin_ma;
+
     /* The d-axis holding size the ramp settled on, in perturbation
      * units. Reported because everything else sits on it: it is what
      * pins the rotor, and what keeps the phase currents away from the
      * zero crossing the dead time turns on. */
     uint16_t hold_duty;
 } estimate_inductance_result_t;
+
+/**
+ * Work out which way round the two current sensors read.
+ *
+ * Drives phase A against phase B with phase C floating, which leaves
+ * exactly one path for the current: in at A's terminal and out at B's.
+ * The true signs are therefore known without measuring them, and what
+ * each sensor reports under that condition is what calibrates it. The
+ * result is handed to sensors_set_direction() and applied to every
+ * reading from then on.
+ *
+ * Worth measuring rather than declaring, because the answer is a
+ * property of the board and not of the firmware: it depends on which way
+ * the shunt sits in the layout and which amplifier input goes to which
+ * side of it. A fork for another board changes both, and the failure it
+ * produces is not obvious -- the currents simply read backwards, and the
+ * control loop then drives the motor away from where it was asked to go
+ * rather than towards it.
+ *
+ * The bridge is driven, so the motor must be connected and free to move.
+ * A small current flows for a few tens of milliseconds and the rotor
+ * twitches.
+ *
+ * @param result_out  where the two directions and the evidence for them
+ *                    are written
+ * @return ESTIMATE_OK, or ESTIMATE_ERR_TOO_SMALL if too little current
+ *         flowed to tell -- which is what a disconnected motor looks
+ *         like, and which leaves the declared directions untouched
+ */
+uint8_t estimate_current_direction(estimate_direction_result_t *result_out);
 
 /**
  * Measure the resistance of each of the three phases.

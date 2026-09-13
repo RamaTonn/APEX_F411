@@ -82,6 +82,26 @@ typedef struct {
     uint16_t zero_counts_a;
     uint16_t zero_counts_b;
 
+    /* Which way round each sensor reads: +1 if a rising reading means
+     * current flowing INTO that phase's terminal, -1 if it means the
+     * opposite.
+     *
+     * Not a constant, because it is not a property of the firmware. It
+     * depends on which way the shunt is oriented in the layout and which
+     * of the amplifier's inputs the board routes to which side of it --
+     * both of which are decisions a fork for another board will make
+     * differently, and neither of which is visible from here. Getting it
+     * wrong does not produce an obvious failure: the currents simply
+     * read backwards, the dq transform hands the control loop a torque
+     * command pointing the wrong way, and the motor runs away from where
+     * it was asked to go.
+     *
+     * Defaulted to +1 and corrected by sensors_set_direction(), which
+     * estimate_current_direction() calls once a current of known sign
+     * has actually been driven through the winding. */
+    int8_t direction_a;
+    int8_t direction_b;
+
     /* Non-zero while sensors_capture_currents() should accumulate raw
      * samples for zero calibration instead of publishing currents. */
     volatile uint8_t  calibrating_currents;
@@ -158,6 +178,28 @@ void sensors_capture_currents(void);
  * @param current_b_out  where to store phase B current. May be NULL.
  */
 void sensors_get_currents(int32_t *current_a_out, int32_t *current_b_out);
+
+/**
+ * Record which way round each current sensor reads.
+ *
+ * Applied to every subsequent reading, so a sensor wired the other way
+ * up reports the same sign as one wired the expected way. Values other
+ * than +1 and -1 are ignored, leaving that channel as it was.
+ *
+ * Establishing these needs a current of KNOWN sign flowing, which needs
+ * the bridge -- so the measurement lives in estimate.c and only its
+ * conclusion is stored here.
+ *
+ * @param direction_a  +1 or -1 for phase A
+ * @param direction_b  +1 or -1 for phase B
+ */
+void sensors_set_direction(int8_t direction_a, int8_t direction_b);
+
+/**
+ * @param direction_a_out  where phase A's direction is written, or NULL
+ * @param direction_b_out  where phase B's direction is written, or NULL
+ */
+void sensors_get_direction(int8_t *direction_a_out, int8_t *direction_b_out);
 
 /**
  * Begin accumulating raw current samples for zero calibration.

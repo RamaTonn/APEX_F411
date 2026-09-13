@@ -152,6 +152,25 @@ int main(void)
 
 	protocol_init();
 
+	/* Work out which way round the current sensors read, now that the
+	 * loop is running and can sample them.
+	 *
+	 * This drives a small current through two phases for a few tens of
+	 * milliseconds. It is done here, before anything else can command
+	 * the bridge, because every dq transform downstream depends on the
+	 * answer and a wrong sign is not a small error -- it points the
+	 * control loop's torque the wrong way.
+	 *
+	 * A disconnected motor produces no current and reports that it could
+	 * not tell, leaving the declared directions in place. That is the
+	 * right outcome for a board on a bench with nothing attached: no
+	 * guess is made from noise, and `idir` will say so when asked.
+	 */
+	{
+		estimate_direction_result_t direction;
+		(void)estimate_current_direction(&direction);
+	}
+
 	/* Time of the last heartbeat blink.
 	 *
 	 * A steadily blinking LED1 is the simplest possible proof that the

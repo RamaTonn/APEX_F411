@@ -44,6 +44,11 @@ uint8_t sensors_start(sensors_t *s)
     self->current_b_ma            = 0;
     self->zero_counts_a           = CURRENT_ZERO_COUNTS_DEFAULT;
     self->zero_counts_b           = CURRENT_ZERO_COUNTS_DEFAULT;
+
+    /* Assumed until a known current has been driven and
+     * estimate_current_direction() has had a look. */
+    self->direction_a             = 1;
+    self->direction_b             = 1;
     self->calibrating_currents    = 0u;
     self->calibration_total_a     = 0u;
     self->calibration_total_b     = 0u;
@@ -117,8 +122,10 @@ void sensors_capture_currents(void)
         return;
     }
 
-    self->current_a_ma = counts_to_milliamps(raw_a, self->zero_counts_a);
-    self->current_b_ma = counts_to_milliamps(raw_b, self->zero_counts_b);
+    self->current_a_ma = counts_to_milliamps(raw_a, self->zero_counts_a)
+                         * (int32_t)self->direction_a;
+    self->current_b_ma = counts_to_milliamps(raw_b, self->zero_counts_b)
+                         * (int32_t)self->direction_b;
 }
 
 void sensors_get_currents(int32_t *current_a_out, int32_t *current_b_out)
@@ -128,6 +135,26 @@ void sensors_get_currents(int32_t *current_a_out, int32_t *current_b_out)
     }
     if (current_b_out != NULL) {
         *current_b_out = self->current_b_ma;
+    }
+}
+
+void sensors_set_direction(int8_t direction_a, int8_t direction_b)
+{
+    if ((direction_a == 1) || (direction_a == -1)) {
+        self->direction_a = direction_a;
+    }
+    if ((direction_b == 1) || (direction_b == -1)) {
+        self->direction_b = direction_b;
+    }
+}
+
+void sensors_get_direction(int8_t *direction_a_out, int8_t *direction_b_out)
+{
+    if (direction_a_out != NULL) {
+        *direction_a_out = self->direction_a;
+    }
+    if (direction_b_out != NULL) {
+        *direction_b_out = self->direction_b;
     }
 }
 

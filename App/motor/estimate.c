@@ -557,6 +557,91 @@ uint8_t estimate_resistance(motor_t *m,
     return ESTIMATE_OK;
 }
 /* ------------------------------------------------------------------
+ * Current sense direction
+ * ------------------------------------------------------------------ */
+
+/* Duty used to drive a current of known sign, and how long to hold it.
+ *
+ * Only has to produce a current large enough to be unambiguous against
+ * the sensor's noise, which is a few hundred milliamps peak. It must
+ * clear the dead time to produce anything at all, so it is derived from
+ * it rather than written down. */
+#define DIRECTION_DUTY (GATE_DRIVER_DEAD_TIME_PER_MILLE + 8U)
+#define DIRECTION_MS   20U
+
+uint8_t estimate_current_direction(estimate_direction_result_t *result_out)
+{
+    if (result_out == NULL) {
+        return ESTIMATE_ERR_ARGUMENT;
+    }
+    if (loop_is_running() == 0u) {
+        return ESTIMATE_ERR_NOT_READY;
+    }
+
+    result_out->direction_a  = 0;
+    result_out->direction_b  = 0;
+    result_out->current_a_ma = 0;
+    result_out->current_b_ma = 0;
+
+    /* Start from the signs as declared, so what is measured is the raw
+     * sensor and not a correction already applied to it. */
+    sensors_set_direction(1, 1);
+
+    /* Phase A driven, phase B at ground, phase C floated. There is
+     * exactly one path: in at A's terminal and out at B's. So the true
+     * currents are positive at A and negative at B, by the sign
+     * convention the whole codebase uses, and no measurement is needed
+     * to know that -- which is what makes this a calibration rather than
+     * an observation. */
+    enable_pair(GATE_DRIVER_PHASE_A, GATE_DRIVER_PHASE_B);
+
+    gate_driver_set_duty(GATE_DRIVER_PHASE_B, 0u);
+    gate_driver_set_duty(GATE_DRIVER_PHASE_A, DIRECTION_DUTY);
+
+    uint8_t outcome = ESTIMATE_OK;
+
+    if (wait_watching_current(DIRECTION_MS, DIRECTION_DUTY) == 0u) {
+        outcome = ESTIMATE_ERR_OVERCURRENT;
+    } else {
+        int32_t current_a;
+        int32_t current_b;
+
+        if (average_phase_current(GATE_DRIVER_PHASE_A, 1, DIRECTION_MS,
+                                  DIRECTION_DUTY, &current_a, NULL) == 0u) {
+            outcome = ESTIMATE_ERR_OVERCURRENT;
+        } else {
+            (void)average_phase_current(GATE_DRIVER_PHASE_B, 1, DIRECTION_MS,
+                                        DIRECTION_DUTY, &current_b, NULL);
+
+            result_out->current_a_ma = current_a;
+            result_out->current_b_ma = current_b;
+
+            /* Too little current to be sure of anything. A disconnected
+             * motor looks exactly like this, and guessing a sign from
+             * noise is worse than admitting there was nothing to read --
+             * the declared signs stay in place and the caller is told. */
+            if ((absolute(current_a) < ESTIMATE_DIRECTION_MINIMUM_MA)
+                    || (absolute(current_b)
+                            < ESTIMATE_DIRECTION_MINIMUM_MA)) {
+                outcome = ESTIMATE_ERR_TOO_SMALL;
+            } else {
+                result_out->direction_a = (current_a > 0) ? 1 : -1;
+                result_out->direction_b = (current_b < 0) ? 1 : -1;
+
+                sensors_set_direction(result_out->direction_a,
+                                      result_out->direction_b);
+            }
+        }
+    }
+
+    rest_bridge();
+    HAL_Delay(DECAY_MS);
+    gate_driver_disable_all();
+
+    return outcome;
+}
+
+/* ------------------------------------------------------------------
  * Inductance
  *
  * Unlike the resistance measurement above, this drives all three phases
@@ -1193,6 +1278,8 @@ uint8_t estimate_inductance(motor_t *m,
     result_out->line_to_line_q_nh = 0u;
     result_out->bus_quiet_mv      = 0u;
     result_out->bus_loaded_mv     = 0u;
+    result_out->ripple_ma         = 0u;
+    result_out->zero_margin_ma    = 0;
 
     enable_bridge();
 
@@ -1321,6 +1408,55 @@ uint8_t estimate_inductance(motor_t *m,
         result_out->q_mohm = (result_out->inductance_q_nh
                               + (result_out->q_tau_us / 2u))
                              / result_out->q_tau_us;
+    }
+
+    /* How close the measurement came to the one thing that silently
+     * ruins it.
+     *
+     * Everything here rests on the dead time being identical in the two
+     * halves of the excitation, and the dead time reverses sign with the
+     * current in the phase it is flowing through. So if a PHASE current
+     * crosses zero at any point in the switching period, that reversal
+     * lands in the very difference the two halves are subtracted to
+     * cancel, and nothing about the answer looks wrong.
+     *
+     * The sampled current is not enough to see this: the sensor is read
+     * once per period at the midpoint of the switching ripple, so it
+     * reports the average and never the excursion. The excursion has to
+     * be computed -- and it can be, now that the inductance is known.
+     *
+     * On a winding of a few microhenries switched at this frequency the
+     * ripple is not a detail. Phase A is high while B and C are low for
+     * the fraction of the period their duties differ by, and two thirds
+     * of the bus stands across it: at three amps of hold on a winding
+     * like the one this was developed against, that is a five amp
+     * peak-to-peak swing on a three amp bias, and the two return phases
+     * at half that sit a hair away from zero. */
+    uint32_t phase_inductance_nh = result_out->inductance_d_nh;
+
+    if (phase_inductance_nh > 0u) {
+        /* The window, in nanoseconds, where the driven phase is high and
+         * the other two are low. */
+        uint32_t window_ns = (uint32_t)(((uint64_t)3u * (uint64_t)hold
+                                         * (uint64_t)GATE_DRIVER_PERIOD_NS)
+                                        / (uint64_t)GATE_DRIVER_DUTY_SCALE);
+
+        /* Two thirds of the bus stands across the driven phase during
+         * it. Millivolts times nanoseconds over nanohenries is
+         * milliamps. */
+        uint64_t volt_time = ((uint64_t)2u * (uint64_t)bus_mv
+                              * (uint64_t)window_ns) / 3u;
+
+        result_out->ripple_ma =
+            (uint32_t)(volt_time / (uint64_t)phase_inductance_nh);
+
+        /* The two return phases carry half the driven phase's current
+         * and half its ripple, so they are the ones that reach zero
+         * first. */
+        int32_t return_bias   = HOLD_TARGET_MA / 2;
+        int32_t return_ripple = (int32_t)result_out->ripple_ma / 2;
+
+        result_out->zero_margin_ma = return_bias - (return_ripple / 2);
     }
 
     /* The same two inductances as a meter across two motor leads would
