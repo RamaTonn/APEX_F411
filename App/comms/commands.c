@@ -798,12 +798,19 @@ static void command_eind(const protocol_args_t *args)
     protocol_reply_uint("d_step", result.d_duty_used);
     protocol_reply_uint("q_step", result.q_duty_used);
     protocol_reply_uint("hold",   result.hold_duty);
+    /* The half length the measurement settled on, in control periods.
+     * Chosen from the winding's own time constant, so it says as much
+     * about the motor as the answer does. */
+    protocol_reply_uint("half",   result.half_periods);
     /* Each axis's time constant, fitted from the shape of its own
-     * response. R = L / tau is an independent check on eres: both axes
-     * should imply the same resistance, and it should be the one eres
-     * measured by a completely different route. */
+     * response, and the resistance it implies. Two checks in one: the
+     * two axes should agree with each other, since a winding has one
+     * resistance whatever its inductance; and both should agree with
+     * eres, which arrives at it by a completely different route. */
     protocol_reply_uint("d_tau",  result.d_tau_us);
     protocol_reply_uint("q_tau",  result.q_tau_us);
+    protocol_reply_uint("d_mohm", result.d_mohm);
+    protocol_reply_uint("q_mohm", result.q_mohm);
     protocol_reply_end();
 }
 

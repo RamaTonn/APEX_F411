@@ -197,19 +197,29 @@ static uint8_t wait_watching_current(uint32_t milliseconds, uint16_t duty)
 /* Average one phase's current over a window, watching the limit
  * throughout.
  *
+ * The bus is averaged over the SAME window, because the two are used
+ * together. The supply on this bench sags nearly two volts between the
+ * measurement's two operating points, so the bus is doing as much work
+ * in the answer as the current is -- and a single instantaneous reading
+ * of a supply that is being pulled about is not worth what an average
+ * of the same window is.
+ *
  * @param phase          which phase's sensor to read
  * @param sign           +1 if current enters that phase's terminal in
  *                       this topology, -1 if it leaves
  * @param milliseconds   how long to average over
  * @param duty           the duty being applied, recorded if it faults
  * @param average_ma_out where the average is written, sign applied
+ * @param bus_mv_out     averaged bus over the same window, or NULL
  * @return 1 on success, 0 on sustained overcurrent */
 static uint8_t average_phase_current(uint8_t   phase,
                                      int32_t   sign,
                                      uint32_t  milliseconds,
                                      uint16_t  duty,
-                                     int32_t  *average_ma_out)
+                                     int32_t  *average_ma_out,
+                                     uint32_t *bus_mv_out)
 {
+    int64_t  bus_total  = 0;
     int64_t  total      = 0;
     uint32_t count      = 0u;
     uint32_t start      = HAL_GetTick();
@@ -238,11 +248,17 @@ static uint8_t average_phase_current(uint8_t   phase,
             over = 0u;
         }
 
-        total += phase_current_ma(phase, current_a, current_b) * sign;
+        total     += phase_current_ma(phase, current_a, current_b) * sign;
+        bus_total += (int64_t)sensors_get_bus_mv();
         count++;
     }
 
     *average_ma_out = (count > 0u) ? (int32_t)(total / (int32_t)count) : 0;
+
+    if (bus_mv_out != NULL) {
+        *bus_mv_out = (count > 0u)
+                          ? (uint32_t)(bus_total / (int64_t)count) : 0u;
+    }
     return 1u;
 }
 
@@ -322,10 +338,12 @@ static uint8_t measure_pair(const resistance_pair_t *pair,
             return ESTIMATE_ERR_OVERCURRENT;
         }
 
-        int32_t measured;
+        int32_t  measured;
+        uint32_t measured_bus_mv;
+
         if (average_phase_current(pair->sense_phase, pair->sense_sign,
                                   RESISTANCE_AVERAGE_MS, duty,
-                                  &measured) == 0u) {
+                                  &measured, &measured_bus_mv) == 0u) {
             return ESTIMATE_ERR_OVERCURRENT;
         }
 
@@ -339,16 +357,17 @@ static uint8_t measure_pair(const resistance_pair_t *pair,
             low_duty    = duty;
             low_current = measured;
 
-            /* Read under load rather than before it: the supply sags
-             * once the measurement starts drawing amps, and the voltage
-             * that matters is the one actually available. */
-            low_bus_mv = sensors_get_bus_mv();
+            /* Averaged over the same window the current was, not
+             * sampled once: the supply sags under load, and the voltage
+             * that matters is the one actually available while the
+             * current being recorded was flowing. */
+            low_bus_mv = measured_bus_mv;
         }
 
         if ((low_duty != 0u) && (measured >= RESISTANCE_HIGH_TARGET_MA)) {
             high_duty    = duty;
             high_current = measured;
-            high_bus_mv  = sensors_get_bus_mv();
+            high_bus_mv  = measured_bus_mv;
             reached      = 1u;
             break;
         }
@@ -568,10 +587,19 @@ uint8_t estimate_resistance(motor_t *m,
  * every phase current away from zero: the dead time reverses sign with
  * the current it is flowing through, so a phase that crosses zero puts
  * a step into the one term the two halves are subtracted to cancel.
- * At this hold the two return phases sit at an amp apiece, which leaves
- * room for a q excitation of well over the few hundred milliamps the
- * measurement actually uses. */
-#define HOLD_TARGET_MA 2000
+ * At this hold the two return phases sit at an amp and a half apiece,
+ * and a phase only reaches zero once the q current passes the hold over
+ * root three -- around 1.7 amps, which is more than twice what the
+ * measurement uses.
+ *
+ * It costs almost nothing from the supply. Every phase sits near half
+ * duty, so the bridge is circulating this current between the windings
+ * rather than drawing it from the rail: about 180 milliamps comes in
+ * from the bus at a 3 amp hold. That matters here, because the supply
+ * on this bench sags nearly two volts at the currents the RESISTANCE
+ * measurement draws, and the bus reading is what sets the scale of the
+ * answer. */
+#define HOLD_TARGET_MA 3000
 #define HOLD_SETTLE_MS 400U
 
 /* Highest d-axis perturbation the holding ramp will reach before giving
@@ -584,24 +612,67 @@ uint8_t estimate_resistance(motor_t *m,
 #define HOLD_SETTLE_MS_STEP 4U
 #define HOLD_AVERAGE_MS     4U
 
-/* Where the three samples sit inside one half of the excitation, in
- * control periods, and how long the half lasts.
+/* How long one half of the excitation lasts, in control periods, and
+ * where its three samples sit.
  *
- * Three rather than two. Two would give a slope, and the difference
- * between the rising and falling slopes would give an inductance -- but
- * only an approximate one, because the resistive drop does not quite
- * cancel between the halves: the current sits above its mean in the
- * raised half and below it in the lowered half, so R times the current
- * leaves a residue that reads as extra inductance. On a winding whose
- * time constant is close to the half length that residue is worth tens
- * of percent.
+ * THREE SAMPLES, NOT TWO
  *
- * A third sample removes it. The ratio between the two inner rises is
- * exp(-gap / tau), which is the winding's own time constant measured
- * from the shape of its response rather than assumed -- and with tau in
- * hand the relation between the excitation and the slope is exact
- * rather than first-order. It costs nothing but a third read, and it
- * hands back the time constant as a result in its own right.
+ *   Two would give a slope, and the difference between the rising and
+ *   falling slopes would give an inductance -- but only an approximate
+ *   one, because the resistive drop does not quite cancel between the
+ *   halves: the current sits above its mean in the raised half and below
+ *   it in the lowered half, so R times the current leaves a residue that
+ *   reads as extra inductance.
+ *
+ *   A third sample removes it. The ratio between the two inner rises is
+ *   exp(-gap / tau), which is the winding's own time constant measured
+ *   from the shape of its response rather than assumed -- and with tau
+ *   in hand the relation between excitation and slope is exact rather
+ *   than first-order. It costs one extra read, and hands back the time
+ *   constant as a result in its own right.
+ *
+ * WHY THE HALF LENGTH IS CHOSEN AT RUN TIME
+ *
+ *   Everything depends on the ratio between the half and the winding's
+ *   own time constant, and a fixed half cannot suit both a fast winding
+ *   and a slow one.
+ *
+ *   Too long and the current settles before the half ends. The second
+ *   rise is then a small difference between large numbers, tau is fitted
+ *   almost entirely to noise -- and in that regime the inductance is
+ *   directly proportional to tau, so all of that noise lands on the
+ *   answer. A fixed twelve periods did exactly this on the motor this
+ *   was developed against: the raw response repeated to three percent
+ *   while the inductance scattered by sixteen, and the inductance
+ *   tracked the fitted tau with a correlation of 0.98.
+ *
+ *   Too short and the current barely curves at all. Tau is then poorly
+ *   determined too -- but harmlessly, because a straight line is very
+ *   nearly the right answer in that regime and the correction tau makes
+ *   is small.
+ *
+ *   Around two time constants is where both are comfortable, and it is
+ *   a broad optimum. So the measurement runs twice: once to find out
+ *   roughly what the winding's time constant is, then again at a half
+ *   length picked to suit it. */
+#define SLOPE_HALF_TARGET_TAUS 2U
+
+/* Bounds on that choice. Four periods is the shortest half that leaves
+ * three distinct samples; twenty-four is long enough for the slowest
+ * winding this board would drive. */
+#define SLOPE_HALF_MINIMUM 4U
+#define SLOPE_HALF_MAXIMUM 24U
+
+/* Where the first pass starts, before anything is known about the
+ * winding. Suits a time constant near a hundred microseconds and gives
+ * a usable answer from about forty to four hundred, which is the whole
+ * range worth probing. */
+#define SLOPE_HALF_PROBE 8U
+
+#define SLOPE_MICROSECONDS_PER_PERIOD (1000000.0f / (float)LOOP_RATE_HZ)
+
+/* One excitation's timing: how long a half lasts, and which periods
+ * within it the three samples are taken at.
  *
  * No sample is taken across a duty change. The current sensor is read
  * once per switching period at a fixed point in the cycle, and where
@@ -609,15 +680,60 @@ uint8_t estimate_resistance(motor_t *m,
  * moves, so readings either side of a change differ by an amount that
  * has nothing to do with the winding. Holding the duty constant across
  * all three samples makes that offset a constant, which subtracts out.
- *
- * Twelve periods is 375 microseconds; the gap between samples is 156. */
-#define SLOPE_HALF_PERIODS  12U
-#define SLOPE_FIRST_PERIOD   1U
-#define SLOPE_MID_PERIOD     6U
-#define SLOPE_LAST_PERIOD   11U
+ * That is what costs the first and last period of every half. */
+typedef struct {
+    uint32_t half_periods;
+    uint32_t first_period;
+    uint32_t middle_period;
+    uint32_t last_period;
+} excitation_shape_t;
 
-#define SLOPE_GAP_PERIODS (SLOPE_MID_PERIOD - SLOPE_FIRST_PERIOD)
-#define SLOPE_MICROSECONDS_PER_PERIOD (1000000.0f / (float)LOOP_RATE_HZ)
+/* Space three samples evenly inside a half, clear of both its edges. */
+static excitation_shape_t shape_for_half(uint32_t half_periods)
+{
+    excitation_shape_t shape;
+
+    if (half_periods < SLOPE_HALF_MINIMUM) {
+        half_periods = SLOPE_HALF_MINIMUM;
+    }
+    if (half_periods > SLOPE_HALF_MAXIMUM) {
+        half_periods = SLOPE_HALF_MAXIMUM;
+    }
+
+    shape.half_periods  = half_periods;
+    shape.first_period  = 1u;
+    shape.middle_period = 1u + ((half_periods - 2u) / 2u);
+    shape.last_period   = half_periods - 1u;
+
+    return shape;
+}
+
+/* The half length that puts SLOPE_HALF_TARGET_TAUS time constants inside
+ * one half, rounded to an even number of periods so the three samples
+ * land evenly.
+ *
+ * A tau of zero means the first pass saw no curvature at all, which
+ * says the winding is slower than anything that half could resolve --
+ * so the longest half available is the right next guess. */
+static uint32_t half_for_tau(uint32_t tau_us)
+{
+    if (tau_us == 0u) {
+        return SLOPE_HALF_MAXIMUM;
+    }
+
+    uint32_t periods = (tau_us * SLOPE_HALF_TARGET_TAUS * LOOP_RATE_HZ)
+                       / 1000000u;
+
+    periods = ((periods + 1u) / 2u) * 2u;
+
+    if (periods < SLOPE_HALF_MINIMUM) {
+        periods = SLOPE_HALF_MINIMUM;
+    }
+    if (periods > SLOPE_HALF_MAXIMUM) {
+        periods = SLOPE_HALF_MAXIMUM;
+    }
+    return periods;
+}
 
 /* Cycles run before anything is recorded, and cycles recorded.
  *
@@ -625,7 +741,13 @@ uint8_t estimate_resistance(motor_t *m,
  * is oscillating steadily about its mean, which takes a couple of cycles
  * to establish from the standing hold. */
 #define SLOPE_WARMUP_CYCLES 2U
-#define SLOPE_CYCLES        8U
+#define SLOPE_CYCLES        32U
+
+/* Cycles for the first pass, which only has to find the winding's time
+ * constant well enough to choose a half length for the second. Being
+ * roughly right is all that is asked of it, and the optimum it is aiming
+ * for is broad, so it runs a quarter as long. */
+#define SLOPE_PROBE_CYCLES  8U
 
 /* How far apart the rising and falling responses must be for an
  * excitation size to count, in milliamps.
@@ -636,13 +758,11 @@ uint8_t estimate_resistance(motor_t *m,
  * of this figure. The excitation is raised until it is met, so asking
  * for more here buys accuracy and pays in current.
  *
- * Fifteen hundred is where that trade settles on this board. The
- * measured error across bus voltages from 12 to 48 volts and windings
- * from 34 to 100 milliohms falls from about six percent at half this
- * figure to under four, and stops improving above it -- while the
- * q-axis swing it implies stays comfortably inside what the holding
- * current can carry without a phase crossing zero. */
-#define SLOPE_MINIMUM_DIFFERENCE_MA 1500
+ * Twenty-two hundred is where that trade settles. Below it the q axis
+ * gets noticeably noisier; above it the excitation jumps to the next
+ * size up and starts eating into the margin the holding current leaves
+ * before a phase crosses zero. */
+#define SLOPE_MINIMUM_DIFFERENCE_MA 2200
 
 /* Above this, the two inner rises are too alike for the ratio between
  * them to say anything about the time constant.
@@ -781,7 +901,7 @@ static uint8_t ramp_to_hold_current(int32_t *hold_out)
         int32_t measured;
         if (average_phase_current(GATE_DRIVER_PHASE_A, 1,
                                   HOLD_AVERAGE_MS, (uint16_t)hold,
-                                  &measured) == 0u) {
+                                  &measured, NULL) == 0u) {
             return ESTIMATE_ERR_OVERCURRENT;
         }
 
@@ -804,35 +924,37 @@ static uint8_t ramp_to_hold_current(int32_t *hold_out)
  *
  * @param hold        d-axis holding size
  * @param axis        which axis the excitation acts on
+ * @param shape       how long the half lasts and where its samples sit
  * @param excitation  signed excitation size for this half
  * @param first_out   rise from the first sample to the second
  * @param second_out  rise from the second sample to the third
  * @return 1 on success, 0 if the current exceeded the limit */
-static uint8_t half_cycle(int32_t               hold,
-                          const axis_drive_t   *axis,
-                          int32_t               excitation,
-                          int32_t              *first_out,
-                          int32_t              *second_out)
+static uint8_t half_cycle(int32_t                   hold,
+                          const axis_drive_t       *axis,
+                          const excitation_shape_t *shape,
+                          int32_t                   excitation,
+                          int32_t                  *first_out,
+                          int32_t                  *second_out)
 {
     int32_t current_a;
     int32_t current_b;
 
     apply_vector(hold, axis, excitation);
 
-    wait_periods(SLOPE_FIRST_PERIOD);
+    wait_periods(shape->first_period);
     sensors_get_currents(&current_a, &current_b);
     int32_t first = axis_current_ma(axis, current_a, current_b);
 
-    wait_periods(SLOPE_MID_PERIOD - SLOPE_FIRST_PERIOD);
+    wait_periods(shape->middle_period - shape->first_period);
     sensors_get_currents(&current_a, &current_b);
     int32_t middle = axis_current_ma(axis, current_a, current_b);
 
-    wait_periods(SLOPE_LAST_PERIOD - SLOPE_MID_PERIOD);
+    wait_periods(shape->last_period - shape->middle_period);
     sensors_get_currents(&current_a, &current_b);
     int32_t last    = axis_current_ma(axis, current_a, current_b);
     int32_t largest = largest_phase_current_ma(current_a, current_b);
 
-    wait_periods(SLOPE_HALF_PERIODS - SLOPE_LAST_PERIOD);
+    wait_periods(shape->half_periods - shape->last_period);
 
     *first_out  = middle - first;
     *second_out = last - middle;
@@ -881,22 +1003,27 @@ static uint8_t half_cycle(int32_t               hold,
  *   the whole expression collapses to L = V (b - a) / difference, which
  *   is the straight-line answer.
  *
+ * @param shape            how long the half lasts and where its samples
+ *                         sit, which is what the relation is written in
+ *                         terms of
  * @param step_voltage_mv  the axis voltage one half applies, about the
  *                         mean
  * @param first_ma         differenced rise over the first gap
  * @param second_ma        differenced rise over the second gap
  * @param tau_us_out       the winding's time constant, 0 if not fitted
  * @return the inductance in nanohenries, or 0 if it could not be found */
-static uint32_t inductance_from_rises(float   step_voltage_mv,
-                                      int32_t first_ma,
-                                      int32_t second_ma,
+static uint32_t inductance_from_rises(const excitation_shape_t *shape,
+                                      float     step_voltage_mv,
+                                      int32_t   first_ma,
+                                      int32_t   second_ma,
                                       uint32_t *tau_us_out)
 {
     const float period_us = SLOPE_MICROSECONDS_PER_PERIOD;
-    const float gap_us    = (float)SLOPE_GAP_PERIODS * period_us;
-    const float a_us      = (float)SLOPE_FIRST_PERIOD * period_us;
-    const float b_us      = (float)SLOPE_LAST_PERIOD * period_us;
-    const float half_us   = (float)SLOPE_HALF_PERIODS * period_us;
+    const float gap_us    = (float)(shape->middle_period
+                                    - shape->first_period) * period_us;
+    const float a_us      = (float)shape->first_period * period_us;
+    const float b_us      = (float)shape->last_period * period_us;
+    const float half_us   = (float)shape->half_periods * period_us;
 
     float total = (float)first_ma + (float)second_ma;
 
@@ -934,19 +1061,24 @@ static uint32_t inductance_from_rises(float   step_voltage_mv,
  *
  * @param hold            d-axis holding size, kept throughout
  * @param axis            which axis to excite
+ * @param shape           how long each half lasts and where its samples
+ *                        sit
+ * @param cycles          how many cycles to average
  * @param bus_mv          the bus the excitation is a fraction of
  * @param inductance_out  result in nanohenries
  * @param difference_out  the differenced response that produced it
  * @param step_out        the excitation size that was needed
  * @param tau_us_out      the winding's time constant on this axis
  * @return an ESTIMATE_ result code */
-static uint8_t measure_axis(int32_t             hold,
-                            const axis_drive_t *axis,
-                            uint32_t            bus_mv,
-                            uint32_t           *inductance_out,
-                            int32_t            *difference_out,
-                            uint16_t           *step_out,
-                            uint32_t           *tau_us_out)
+static uint8_t measure_axis(int32_t                   hold,
+                            const axis_drive_t       *axis,
+                            const excitation_shape_t *shape,
+                            uint32_t                  cycles,
+                            uint32_t                  bus_mv,
+                            uint32_t                 *inductance_out,
+                            int32_t                  *difference_out,
+                            uint16_t                 *step_out,
+                            uint32_t                 *tau_us_out)
 {
     for (uint32_t i = 0u; i < EXCITATION_STEP_COUNT; i++) {
 
@@ -957,9 +1089,9 @@ static uint8_t measure_axis(int32_t             hold,
         int32_t lowered_second;
 
         for (uint32_t warm = 0u; warm < SLOPE_WARMUP_CYCLES; warm++) {
-            if ((half_cycle(hold, axis,  step,
+            if ((half_cycle(hold, axis, shape,  step,
                             &raised_first, &raised_second) == 0u)
-                || (half_cycle(hold, axis, -step,
+                || (half_cycle(hold, axis, shape, -step,
                                &lowered_first, &lowered_second) == 0u)) {
                 return ESTIMATE_ERR_OVERCURRENT;
             }
@@ -968,10 +1100,10 @@ static uint8_t measure_axis(int32_t             hold,
         int64_t first_total  = 0;
         int64_t second_total = 0;
 
-        for (uint32_t cycle = 0u; cycle < SLOPE_CYCLES; cycle++) {
-            if ((half_cycle(hold, axis,  step,
+        for (uint32_t cycle = 0u; cycle < cycles; cycle++) {
+            if ((half_cycle(hold, axis, shape,  step,
                             &raised_first, &raised_second) == 0u)
-                || (half_cycle(hold, axis, -step,
+                || (half_cycle(hold, axis, shape, -step,
                                &lowered_first, &lowered_second) == 0u)) {
                 return ESTIMATE_ERR_OVERCURRENT;
             }
@@ -982,8 +1114,8 @@ static uint8_t measure_axis(int32_t             hold,
         /* Back to the plain hold before anything else happens. */
         apply_vector(hold, axis, 0);
 
-        int32_t first  = (int32_t)(first_total  / (int64_t)SLOPE_CYCLES);
-        int32_t second = (int32_t)(second_total / (int64_t)SLOPE_CYCLES);
+        int32_t first  = (int32_t)(first_total  / (int64_t)cycles);
+        int32_t second = (int32_t)(second_total / (int64_t)cycles);
 
         *difference_out = first + second;
         *step_out       = (uint16_t)step;
@@ -999,7 +1131,7 @@ static uint8_t measure_axis(int32_t             hold,
         float step_voltage_mv =
             ((float)bus_mv * (float)step * axis->voltage_scale) / 1000.0f;
 
-        uint32_t nanohenries = inductance_from_rises(step_voltage_mv,
+        uint32_t nanohenries = inductance_from_rises(shape, step_voltage_mv,
                                                      first, second,
                                                      tau_us_out);
         if (nanohenries == 0u) {
@@ -1038,6 +1170,9 @@ uint8_t estimate_inductance(motor_t *m,
     result_out->q_duty_used      = 0u;
     result_out->d_tau_us         = 0u;
     result_out->q_tau_us         = 0u;
+    result_out->d_mohm           = 0u;
+    result_out->q_mohm           = 0u;
+    result_out->half_periods     = 0u;
     result_out->hold_duty        = 0u;
 
     enable_bridge();
@@ -1068,13 +1203,46 @@ uint8_t estimate_inductance(motor_t *m,
      * the voltage that matters is the one actually available. */
     uint32_t bus_mv = sensors_get_bus_mv();
 
-    /* Along the magnet axis. The excitation points the way the rotor is
-     * already aligned, so it adds no torque at all. */
-    uint8_t outcome = measure_axis(hold, &axis_d, bus_mv,
-                                   &result_out->inductance_d_nh,
-                                   &result_out->d_difference_ma,
-                                   &result_out->d_duty_used,
-                                   &result_out->d_tau_us);
+    /* First pass: a short run at a middling half length, whose only job
+     * is to find out roughly how fast this winding is. The d axis is
+     * used for it because it produces no torque at all -- the excitation
+     * points the way the rotor is already aligned.
+     *
+     * Its inductance is thrown away. The half length it suggests is the
+     * whole point of it. */
+    excitation_shape_t probe_shape = shape_for_half(SLOPE_HALF_PROBE);
+
+    uint32_t probe_inductance = 0u;
+    int32_t  probe_difference = 0;
+    uint16_t probe_step       = 0u;
+    uint32_t probe_tau_us     = 0u;
+
+    uint8_t outcome = measure_axis(hold, &axis_d, &probe_shape,
+                                   SLOPE_PROBE_CYCLES, bus_mv,
+                                   &probe_inductance, &probe_difference,
+                                   &probe_step, &probe_tau_us);
+
+    if (outcome != ESTIMATE_OK) {
+        rest_bridge();
+        HAL_Delay(DECAY_MS);
+        gate_driver_disable_all();
+        return outcome;
+    }
+
+    /* Second pass, at a half length suited to what the first pass
+     * found. Both axes are measured with the same shape so that the
+     * saliency is a comparison of like with like: the two differ in
+     * inductance, and nothing else about how they were measured should
+     * differ with them. */
+    excitation_shape_t shape = shape_for_half(half_for_tau(probe_tau_us));
+
+    result_out->half_periods = (uint16_t)shape.half_periods;
+
+    outcome = measure_axis(hold, &axis_d, &shape, SLOPE_CYCLES, bus_mv,
+                           &result_out->inductance_d_nh,
+                           &result_out->d_difference_ma,
+                           &result_out->d_duty_used,
+                           &result_out->d_tau_us);
 
     if (outcome == ESTIMATE_OK) {
         /* Across the magnet axis, with the SAME holding current still
@@ -1087,7 +1255,7 @@ uint8_t estimate_inductance(motor_t *m,
          * Measured independently of the d axis rather than assumed equal
          * to it: the difference between the two is the saliency, which
          * is the whole reason for taking two measurements. */
-        outcome = measure_axis(hold, &axis_q, bus_mv,
+        outcome = measure_axis(hold, &axis_q, &shape, SLOPE_CYCLES, bus_mv,
                                &result_out->inductance_q_nh,
                                &result_out->q_difference_ma,
                                &result_out->q_duty_used,
@@ -1105,6 +1273,26 @@ uint8_t estimate_inductance(motor_t *m,
     if (result_out->inductance_d_nh > 0u) {
         result_out->saliency_percent =
             (result_out->inductance_q_nh * 100u) / result_out->inductance_d_nh;
+    }
+
+    /* The resistance each axis implies, from R = L / tau.
+     *
+     * Not used for anything here -- it is reported because it is an
+     * independent check on estimate_resistance(), arrived at with
+     * nothing in common with it. Both axes should agree with each other,
+     * since the winding has one resistance whatever its inductance, and
+     * both should agree with what the resistance measurement found by
+     * an entirely different route. Where they do not, the one drawing
+     * amps through a sagging supply is the one to doubt. */
+    if (result_out->d_tau_us > 0u) {
+        result_out->d_mohm = (result_out->inductance_d_nh
+                              + (result_out->d_tau_us / 2u))
+                             / result_out->d_tau_us;
+    }
+    if (result_out->q_tau_us > 0u) {
+        result_out->q_mohm = (result_out->inductance_q_nh
+                              + (result_out->q_tau_us / 2u))
+                             / result_out->q_tau_us;
     }
 
     /* Stored in henries, converted from the nanohenries the protocol

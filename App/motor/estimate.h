@@ -244,6 +244,28 @@ typedef struct {
     uint32_t d_tau_us;
     uint32_t q_tau_us;
 
+    /* The per-phase resistance each axis implies, R = L / tau, in
+     * milliohms.
+     *
+     * This measurement shares nothing with estimate_resistance(): it
+     * draws almost no current from the supply, since every phase sits
+     * near half duty and the holding current circulates between the
+     * windings rather than coming in from the rail. So where the two
+     * disagree, this is the one to believe.
+     *
+     * The two axes should also agree with EACH OTHER. A winding has one
+     * resistance whatever its inductance, so if these differ by much,
+     * something axis-dependent is in the measurement that should not be
+     * -- the likeliest being a rotor that did not stay where it was
+     * put. */
+    uint32_t d_mohm;
+    uint32_t q_mohm;
+
+    /* Half length the second pass settled on, in control periods.
+     * Chosen from the winding's own time constant rather than fixed --
+     * see estimate.c on why a fixed one cannot suit every motor. */
+    uint16_t half_periods;
+
     /* The d-axis holding size the ramp settled on, in perturbation
      * units. Reported because everything else sits on it: it is what
      * pins the rotor, and what keeps the phase currents away from the
