@@ -81,6 +81,8 @@ static const struct {
     { "quiet_mv",  0x6Eu },
     { "load_mv",   0x6Fu },
     { "ms",        0x70u },
+    { "eff",       0x71u },
+    { "sum_ma",    0x72u },
     { "d_mohm",    0x6Au },
     { "q_mohm",    0x6Bu },
     { "d_tau",     0x67u },

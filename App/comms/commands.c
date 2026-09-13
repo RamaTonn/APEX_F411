@@ -955,6 +955,13 @@ static void command_ical(const protocol_args_t *args)
         protocol_reply_text("reason", "overcurrent");
     }
     protocol_reply_uint("duty",    duty);
+    /* What is left of the duty after the dead time takes its cut, which
+     * is what actually reaches the winding. At or below zero the high
+     * side never turns on at all and no current flows however long the
+     * hold runs -- so a reading taken there is the sensor's zero, not a
+     * measurement. */
+    protocol_reply_int("eff",
+        (int32_t)duty - (int32_t)GATE_DRIVER_DEAD_TIME_PER_MILLE);
     protocol_reply_uint("ms",      hold_ms);
     /* Phase A carries the whole current; B returns all of it, so ib
      * should read the negative of ia. A pair that does not mirror says
@@ -962,6 +969,21 @@ static void command_ical(const protocol_args_t *args)
      * compared with anything outside. */
     protocol_reply_int("ia_ma",    (int32_t)(total_a / (int64_t)samples));
     protocol_reply_int("ib_ma",    (int32_t)(total_b / (int64_t)samples));
+    /* Phase C is disabled here, so it carries nothing and the other two
+     * currents must sum to exactly zero -- that is Kirchhoff's law at
+     * the star point, not an assumption about the winding. Whatever this
+     * reads instead is the two sensors disagreeing with each other, and
+     * it needs no instrument outside the board to see.
+     *
+     * It is worth knowing because of WHICH roles the two are in. Phase A
+     * is being chopped and phase B is held at ground, so its low-side
+     * device conducts continuously and never switches. If a sensor reads
+     * differently in those two roles, the resistance measurement will
+     * report an imbalance that is not in the motor: its three pairs
+     * cannot all put the sensed phase in the same role, because phase C
+     * has no sensor to put anywhere. */
+    protocol_reply_int("sum_ma",
+        (int32_t)((total_a + total_b) / (int64_t)samples));
     protocol_reply_int("peak_ma",  peak_ma);
     /* The bus before the current flowed, and while it was flowing. A gap
      * between these two is what a meter on the bus settles. */
