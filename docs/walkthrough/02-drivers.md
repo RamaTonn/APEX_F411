@@ -9,7 +9,7 @@ buffer.
 |---|---|---|---|
 | `drivers/encoder.{h,c}` | 728 | 232 | logic exhaustively correct; **two serious context bugs** |
 | `drivers/gate_driver.{h,c}` | 544 | 152 | correct, including the dead-time sign; one wrong comment |
-| `drivers/sensors.{h,c}` | 426 | 106 | correct; one fragile contract, one missing `volatile` |
+| `drivers/sensors.{h,c}` | 426 | 106 | acquisition path now documented; one latent stopper, one open question |
 | `drivers/USB_Comm.{h,c}` | 370 | 98 | ring buffer reasoning is sound; dead code left in comments |
 
 The headline for this batch is not any single line. It is **execution context** — which
@@ -399,6 +399,102 @@ Two ADC groups with genuinely different timing requirements, deliberately in one
 The injected group automatically preempts the regular group, which is the whole reason
 both exist: a current sample is never delayed by a slow housekeeping conversion.
 
+### How a current measurement actually happens
+
+The two groups do not merely have different timing — **they have entirely different data
+paths**, and conflating them is the easiest way to misread this module. On the F4 the
+injected group has no DMA capability at all: HAL offers `HAL_ADCEx_InjectedStart`,
+`_IT`, `_Stop`, `_PollForConversion` and `_GetValue`, and no `_DMA` variant exists. Its
+results land in four hardware registers, `JDR1`–`JDR4`, and stay there until overwritten.
+
+```
+CURRENTS   TIM3 CC4 match ─► ADC injected group ─► JDR1, JDR2 ─► read in the ISR
+           (hardware)         CH0 then CH1          (registers)   by sensors_capture_currents()
+
+BUS, TEMP  free-running ────► ADC regular group ─► DMA ─► regular_results[2] in RAM
+           (continuous)       CH2 then CH9                read any time, no ADC involved
+```
+
+**Arming, once, at startup.** Two calls, in two different files, and the order between
+them matters:
+
+1. `sensors_start()` calls `HAL_ADC_Start_DMA(&hadc1, ...)`. This turns the ADC on
+   (`ADON`), starts the regular group converting continuously, and points the DMA at
+   `regular_results`. From here the bus and temperature channels refresh forever with no
+   further software involvement.
+2. `loop_start()` calls `HAL_ADCEx_InjectedStart_IT(&hadc1)` (`loop.c` L192). Read from
+   the HAL source, this does exactly three things that matter: it enables the ADC if it
+   is not already on, it clears `JEOC` and **enables the `JEOC` interrupt**, and then —
+   *only if* `JEXTEN` is clear — it fires a software start.
+
+   `JEXTEN` is **not** clear for us. `MX_ADC1_Init` sets
+   `ExternalTrigInjecConv = ADC_EXTERNALTRIGINJECCONV_T3_CC4` with a rising edge, so
+   the final block is skipped and **no conversion is started here**. The function's
+   entire effect is to arm the interrupt and return.
+
+That is the answer to "how are the current sensors triggered": they are not triggered by
+software at all, ever. After the arming call, every conversion for the life of the
+program is started by the timer in hardware, with no CPU involvement and therefore no
+jitter.
+
+**Every period, with no software involvement.** TIM3's channel 4 compare matches at
+`CCR4` on the down-count; the ADC begins the injected sequence; channel 0 (phase A) is
+sampled and converted, then channel 1 (phase B); `JEOC` sets at the end of the *pair*;
+the NVIC vectors to `ADC_IRQHandler` → `HAL_ADC_IRQHandler` →
+`HAL_ADCEx_InjectedConvCpltCallback`, which is `loop.c`'s ISR.
+
+**Reading the result.** This is the question the module's own comments never answer, so
+here is the function in full, from `stm32f4xx_hal_adc_ex.c`:
+
+```c
+uint32_t HAL_ADCEx_InjectedGetValue(ADC_HandleTypeDef *hadc, uint32_t InjectedRank)
+{
+  __IO uint32_t tmp = 0U;
+  assert_param(IS_ADC_INJECTED_RANK(InjectedRank));
+  __HAL_ADC_CLEAR_FLAG(hadc, ADC_FLAG_JEOC);
+  switch (InjectedRank)
+  {
+    case ADC_INJECTED_RANK_4: tmp = hadc->Instance->JDR4; break;
+    case ADC_INJECTED_RANK_3: tmp = hadc->Instance->JDR3; break;
+    case ADC_INJECTED_RANK_2: tmp = hadc->Instance->JDR2; break;
+    case ADC_INJECTED_RANK_1: tmp = hadc->Instance->JDR1; break;
+    default: break;
+  }
+  return tmp;
+}
+```
+
+So, precisely:
+
+- **It does not trigger anything.** There is no start, no `SWSTART`, no waiting on a
+  flag, no polling loop. The conversion finished before the interrupt that brought us
+  here was raised.
+- **It does not read the DMA buffer.** `regular_results` is untouched by this path. It
+  reads `JDR1` or `JDR2`, which are registers inside the ADC peripheral.
+- **It is a pure register read plus one side effect**: it clears `JEOC`. That side
+  effect is not documented in the function's name and matters — see S2.4.
+
+Which is why `sensors_capture_currents()` must run *in the ISR* and not later: the JDR
+registers hold one sample each, and the next timer trigger 31 µs later overwrites them
+with no warning and no overrun flag for the reader. Contrast `sensors_get_bus_mv()`,
+which touches no peripheral at all — it indexes an array the DMA has been filling
+independently, and is safe to call from any context at any time.
+
+**What keeps it running.** `HAL_ADC_IRQHandler` contains a block that disables the
+`JEOC` interrupt after a conversion, which would stop the control loop dead after one
+period. Its condition begins:
+
+```c
+if (ADC_IS_SOFTWARE_START_INJECTED(hadc) && ...)
+{
+  __HAL_ADC_DISABLE_IT(hadc, ADC_IT_JEOC);
+```
+
+`&&` short-circuits on the first term, and the first term is false for us precisely
+because the trigger is `T3_CC4` rather than software. The control loop therefore runs
+continuously **as a consequence of the trigger source**, not of anything this firmware
+does. See S2.3.
+
 ### Line by line — the parts that carry weight
 
 **L56–70 `HAL_ADC_Start_DMA(&hadc1, (uint32_t *)(void *)self->regular_results, 2)`** —
@@ -455,6 +551,65 @@ rather than `_end_` on timeout. It runs in main context so its `HAL_GetTick()` w
 So the bug cannot fire today. It is one careless second caller away from firing, and
 dividing by `calibration_samples_taken` with a zero guard would make it impossible
 instead of merely unlikely.
+
+**S2.3 — HIGH (latent, one edit away). The control loop only keeps running because the
+injected trigger is hardware.**
+
+`HAL_ADC_IRQHandler` disables the `JEOC` interrupt when
+`ADC_IS_SOFTWARE_START_INJECTED(hadc)` is true. Today it is false, because
+`MX_ADC1_Init` sets `ExternalTrigInjecConv = ADC_EXTERNALTRIGINJECCONV_T3_CC4`. Change
+that one CubeMX field to software start — while debugging, while porting, while trying
+to run the loop without the timer — and HAL disables the interrupt after the **first**
+conversion. The loop runs exactly once and stops, with the ADC still on, the bridge
+still enabled at whatever duty was last written, and no fault raised anywhere.
+
+Nothing in this firmware states that dependency. It deserves a comment at
+`HAL_ADCEx_InjectedStart_IT`'s call site in `loop.c`, and arguably a check that
+`JEXTEN` is set after arming.
+
+**S2.4 — MEDIUM. `JEOC` is cleared three times per interrupt, and the last one happens
+after the callback returns.**
+
+`HAL_ADCEx_InjectedGetValue` clears `JEOC` on every call — twice per ISR, once per rank
+— and then `HAL_ADC_IRQHandler` clears it again *after* the callback returns:
+
+```c
+HAL_ADCEx_InjectedConvCpltCallback(hadc);          /* our whole control loop runs here */
+__HAL_ADC_CLEAR_FLAG(hadc, (ADC_FLAG_JSTRT | ADC_FLAG_JEOC));
+```
+
+If the ISR ever runs longer than a PWM period, the next conversion completes while we
+are still inside it, sets `JEOC`, and that final line **clears the flag we never
+served**. The NVIC pending bit survives, so the handler re-enters, finds `JEOC` clear,
+and returns without calling the callback. The loop recovers on the following trigger.
+
+So an overrun costs a **whole missed control period**, not a late one — the currents for
+that period are lost and the duty from two periods ago stays on the bridge. That is
+worth knowing when reading `loop_get_overrun_count()`, which counts a different thing
+(re-entrancy) and will not count this.
+
+**S2.5 — OPEN QUESTION, needs a bench check. Does the temperature channel ever convert?**
+
+The regular group is two channels at `ADC_SAMPLETIME_480CYCLES`. At `ADCCLK = 24 MHz`
+that is `(480 + 12) / 24 MHz = 20.5 µs` per conversion, so the two-channel sequence
+needs 41 µs. The injected group preempts it every 31.2 µs.
+
+`sensors.h` states both slow channels "refresh roughly every 45 microseconds once the
+injected interruptions are allowed for". That figure assumes a preempted regular
+conversion **resumes**. If instead the regular *sequence* restarts from rank 1 after
+each injected preemption — which is the behaviour I believe the reference manual
+specifies for this family, and which I cannot confirm from anything in this repository —
+then rank 2 would need 41 µs of uninterrupted time that never exists, and
+**`temp_raw` would never update from its power-on value**.
+
+This is cheap to settle on the bench and I would rather it were settled than reasoned
+about: run `sense`, warm the thermistor between two fingers, run `sense` again. If
+`temp_raw` moves, the comment is right. If it sits at exactly its initial value — 0
+from the zeroed DMA buffer, rather than the ~4000 that
+`SENSORS_TEMPERATURE_DISCONNECTED` documents for an empty connector — the sequence is
+restarting and the bus reading is the only regular channel that works. Note that the bus
+reading being correct proves nothing either way: it is rank 1, and rank 1 converts first
+under both behaviours.
 
 **S2.2 — LOW. `direction_a` / `direction_b` are not `volatile`.** They are written from
 main context (`sensors_set_direction`, via `estimate_current_direction`) and read inside
@@ -590,7 +745,10 @@ every subsequent batch searches `App Core/Src USB_DEVICE Middlewares`.
 | E2.1 | **High** | `telemetry_capture` → `encoder_read_angle` uses a tick-based SPI timeout inside the ADC ISR, where ticks are frozen — a stalled SPI hangs the board permanently with no recovery |
 | E2.2 | **High** | SPI shared between ISR and main context; `exchange_frame_direct` bypasses HAL's state check and lock. `angle`/`encdiag` while the loop runs can feed the control loop a diagnostics register as a rotor angle |
 | E2.3 | Medium | A timed-out direct exchange leaves `RXNE` set; the pipeline is then permanently one frame stale, with no `OVR` check or resync |
+| S2.3 | **High** (latent) | The loop runs continuously only because the injected trigger is hardware; switching it to software start makes HAL disable `JEOC` after one conversion and the loop stops dead with the bridge still driving |
 | S2.1 | Medium | `sensors_end_current_calibration` divides by the constant 64, not the samples actually taken — an early call bakes a ~41 A phantom offset into every reading |
+| S2.4 | Medium | `JEOC` is cleared after the callback returns, so an ISR overrun silently costs a whole control period rather than a late one, uncounted by `loop_get_overrun_count()` |
+| S2.5 | Open | Whether the regular sequence restarts on injected preemption, and so whether `temp_raw` ever updates — one `sense`, warm the thermistor, `sense` again |
 | G2.1 | Low | `duty_to_compare_value`'s comment describes edge-aligned counting; TIM3 is centre-aligned. Duty high by 0.067%; the worked overflow example is also wrong |
 | G2.2 | Low | `self` dereferenced unguarded in `set_duty`/`get_duty`/`is_enabled` while `disable_all` guards and documents why |
 | S2.2 | Low | `direction_a`/`direction_b` not `volatile` where every other cross-context field in the struct is |
